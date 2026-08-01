@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Launch Claude Code with real Claude models (OAuth/Anthropic-direct tier).
+# Exports the model IDs explicitly so they take priority over any
+# inherited defaults. Engineers not using this wrapper still get Claude
+# via whatever default routing is configured for them.
+set -euo pipefail
+
+# Resolve repo root from this script's own path (readlink -f handles symlinked installs).
+_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(cd "$(dirname "$_SELF")/.." && pwd)"
+REPO_LIB="$REPO_ROOT/lib"
+
+_get() {
+  python3 "$REPO_LIB/profile.py" --get "$1"
+}
+
+export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-$(_get models.oauth.opus)}"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="${ANTHROPIC_DEFAULT_SONNET_MODEL:-$(_get models.oauth.sonnet)}"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="${ANTHROPIC_DEFAULT_HAIKU_MODEL:-$(_get models.oauth.haiku)}"
+export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-$(_get models.oauth.opus)}"
+export ANTHROPIC_SMALL_FAST_MODEL="${ANTHROPIC_SMALL_FAST_MODEL:-$(_get models.oauth.small_fast)}"
+
+exec claude "$@"

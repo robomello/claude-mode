@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""claude-mode: toggle this account's Claude Code between backends.
+
+Usage:
+  claude-mode status        # show active backend, proxy health, and account
+  claude-mode nexus         # route inference through the Nexus Claude proxy
+  claude-mode gpt           # route through the Nexus GPT tier (opus/sonnet/haiku pairs)
+  claude-mode local         # route to the on-prem local model, via bedrock-proxy
+  claude-mode oauth         # route back to the Claude subscription
+  claude-mode toggle        # cycle through profile.json's toggle_cycle
+  claude-mode test          # live round-trip through the active backend
+
+Aliases:
+  status : st
+  nexus  : bedrock
+  gpt    : sol, luna, terra
+  oauth  : claude, sub, subscription
+
+Backends:
+  nexus - Claude models via the configured Nexus proxy
+  gpt   - GPT tier via the same proxy (opus/sonnet/haiku pair rotation)
+  local - on-prem model via vLLM, reached through bedrock-proxy
+  oauth - Claude subscription (OAuth, newest models)
+
+All site-specific values (proxy URLs, ports, model IDs, tunnel host, token
+env var names, toggle order) come from profile.json - see lib/profile.py.
+Nothing here is hardcoded to a particular site.
+
+Only edits ~/.claude/settings.json -- the one settings file most team-sync
+tooling never regenerates -- so the choice survives team re-syncs.
+
+Restart your `claude` session (exit + relaunch) after switching.
+"""
+import os
+import sys
+import urllib.request
+
+_BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+_REPO_ROOT = os.path.dirname(_BIN_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from lib import settings as cm_settings
+from lib.profile import Profile, ProfileError
+
+def _env_file_path():
+    # Computed fresh on every call (not a module-level constant) so that
+    # changing $HOME - as tests do, per HOME=$(mktemp -d) - is honored
+    # without needing a re-import.
+    return os.path.join(os.path.expanduser("~"), ".env")
+
+
+# env var names claude-mode itself manages inside settings.json - unrelated
+# to whatever else lives there or in ~/.env.
+K_USE_BEDROCK = "CLAUDE_CODE_USE_BEDROCK"
+K_BASE_URL = "ANTHROPIC_BEDROCK_BASE_URL"
+K_BEARER = "AWS_BEARER_TOKEN_BEDROCK"
+K_SONNET = "ANTHROPIC_DEFAULT_SONNET_MODEL"
+K_OPUS = "ANTHROPIC_DEFAULT_OPUS_MODEL"
+K_HAIKU = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+K_SMALL_FAST = "ANTHROPIC_SMALL_FAST_MODEL"
+MODEL_KEYS = {
+    "opus": K_OPUS,
+    "sonnet": K_SONNET,
+    "haiku": K_HAIKU,
+    "small_fast": K_SMALL_FAST,
+}
+BEDROCK_ENV_KEYS = (K_USE_BEDROCK, K_BASE_URL, K_BEARER)
+
+TEST_TIMEOUT_SECONDS = 20
+HEALTH_TIMEOUT_SECONDS = 4
+
+
+def env_lookup(key):
+    """Return value of `key` from ~/.env, or None. Ignores comments/quotes."""
+    try:
+        with open(_env_file_path()) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _model_env(profile, mode):
+    models = profile.get(f"models.{mode}")
+    return {MODEL_KEYS[role]: model_id for role, model_id in models.items() if role in MODEL_KEYS}
+
+
+def _http_ok(url, timeout=HEALTH_TIMEOUT_SECONDS):
+    """Cross-platform health probe: plain urllib GET with a short timeout.
+    No shell-outs (`nc`, `timeout`) so this works unmodified on macOS."""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def proxy_ok(profile):
+    return _http_ok(profile.get("bedrock.base_url").rstrip("/") + "/v1/models")
+
+
+def local_health_ok(profile):
+    """Non-fatal probe of the direct local endpoint. Never blocks the switch."""
+    return _http_ok(profile.get("local.base_url").rstrip("/") + "/v1/models")
+
+
+def set_nexus(cfg, profile):
+    token_key = profile.get("tokens.bedrock_env")
+    token = env_lookup(token_key)
+    if not token:
+        print(f"ABORT: no {token_key} found in {_env_file_path()}.")
+        print(f"  Add it first, e.g.:  echo '{token_key}=<your-nexus-gateway-token>' >> ~/.env")
+        print("  (that file is chmod 600 and stays out of git; the toggle reads it here.)")
+        sys.exit(1)
+    set_env = {
+        K_USE_BEDROCK: "1",
+        K_BASE_URL: profile.get("bedrock.base_url"),
+        K_BEARER: token,
+    }
+    set_env.update(_model_env(profile, "nexus"))
+    cm_settings.apply_env(cfg, set_env=set_env)
+    cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
+
+
+def set_gpt(cfg, profile):
+    token_key = profile.get("tokens.bedrock_env")
+    fallback_key = profile.get_or("tokens.gpt_fallback_env", None)
+    token = env_lookup(token_key) or (env_lookup(fallback_key) if fallback_key else None)
+    if not token:
+        names = token_key if not fallback_key else f"{token_key} or {fallback_key}"
+        print(f"ABORT: no {names} found in {_env_file_path()}.")
+        print(f"  Add one, e.g.:  echo '{token_key}=<your-nexus-gateway-token>' >> ~/.env")
+        sys.exit(1)
+    set_env = {
+        K_USE_BEDROCK: "1",
+        K_BASE_URL: profile.get("bedrock.base_url"),
+        K_BEARER: token,
+    }
+    set_env.update(_model_env(profile, "gpt"))
+    cm_settings.apply_env(cfg, set_env=set_env)
+    cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
+
+
+def set_local(cfg, profile):
+    if not local_health_ok(profile):
+        print(f"WARNING: local model health check failed ({profile.get('local.base_url')} not answering).")
+        print("  Continuing anyway -- the mode switch does not depend on the probe.")
+    token_key = profile.get("tokens.bedrock_env")
+    token = env_lookup(token_key)
+    if not token:
+        # Local still needs a placeholder token for the Bedrock header, but it
+        # won't be used to call Nexus (local routing happens before BYOK/Nexus).
+        print(f"NOTE: no {token_key} in ~/.env, using dummy token for local mode (no Nexus calls)")
+        token = "local-bypass"
+    set_env = {
+        K_USE_BEDROCK: "1",
+        K_BASE_URL: profile.get("bedrock.base_url"),
+        K_BEARER: token,
+    }
+    set_env.update(_model_env(profile, "local"))
+    cm_settings.apply_env(cfg, set_env=set_env)
+    cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
+
+
+def set_oauth(cfg, profile):
+    set_env = _model_env(profile, "oauth")
+    cm_settings.apply_env(cfg, set_env=set_env, remove_env=BEDROCK_ENV_KEYS)
+    cm_settings.apply_top(cfg, set_top={"forceLoginMethod": "claudeai"})
+
+
+def current_mode_detailed(cfg, profile):
+    env = cfg.get("env", {})
+    if env.get(K_USE_BEDROCK) != "1":
+        return "oauth"
+    sonnet = env.get(K_SONNET, "")
+    gpt_models = profile.get("models.gpt")
+    local_models = profile.get("models.local")
+    if sonnet == gpt_models.get("sonnet"):
+        return "gpt"
+    if sonnet == local_models.get("sonnet"):
+        return "local"
+    return "nexus"
+
+
+def gpt_token_source(profile):
+    """Which ~/.env var GPT mode resolves its token from, mirroring set_gpt()'s
+    precedence (bedrock_env preferred, gpt_fallback_env fallback).
+    Returns the var name, or None if neither is set."""
+    token_key = profile.get("tokens.bedrock_env")
+    if env_lookup(token_key):
+        return token_key
+    fallback_key = profile.get_or("tokens.gpt_fallback_env", None)
+    if fallback_key and env_lookup(fallback_key):
+        return fallback_key
+    return None
+
+
+def status(profile):
+    path = cm_settings.settings_path()
+    cfg = cm_settings.load(path)
+    mode = current_mode_detailed(cfg, profile)
+    env = cfg.get("env", {})
+    print(f"Active backend : {mode.upper()}")
+    if mode == "nexus":
+        print(f"  route        : Nexus (Claude) via {env.get(K_BASE_URL)}")
+        print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
+    elif mode == "gpt":
+        print("  route        : Nexus GPT tier (opus/sonnet/haiku pair rotation)")
+        print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
+    elif mode == "local":
+        print(f"  route        : local model (vLLM) via {env.get(K_BASE_URL)}")
+        print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
+        print(f"  local model  : {'up' if local_health_ok(profile) else 'DOWN — not answering'}")
+    else:
+        print("  route        : Claude subscription (OAuth)")
+    token_key = profile.get("tokens.bedrock_env")
+    tok = env_lookup(token_key)
+    print(f"  nexus token  : {'present in ~/.env' if tok else f'MISSING from ~/.env ({token_key}; nexus will abort)'}")
+    if mode == "gpt":
+        src = gpt_token_source(profile)
+        fallback_key = profile.get_or("tokens.gpt_fallback_env", None)
+        need = token_key if not fallback_key else f"{token_key} or {fallback_key}"
+        int_status = f"present ({src})" if src else f"MISSING - need {need}"
+        print(f"  gpt token    : {int_status}")
+    print(f"  sonnet       : {env.get(K_SONNET)}")
+    print(f"  opus         : {env.get(K_OPUS)}")
+    print(f"  haiku        : {env.get(K_HAIKU)}")
+
+
+def switch(target, profile):
+    path = cm_settings.settings_path()
+    cfg = cm_settings.load(path)
+    now = current_mode_detailed(cfg, profile)
+    if now == target:
+        print(f"Already on {target.upper()}. Nothing to do.")
+        return
+    if target in ("nexus", "gpt", "local") and not proxy_ok(profile):
+        tunnel_host = profile.get_or("tunnel.host", None)
+        if tunnel_host:
+            print(f"ABORT: Nexus proxy at {profile.get('bedrock.base_url')} is not answering.")
+            print(f"  A tunnel host is configured ({tunnel_host}). Run this first:")
+            print("    claude-mode-tunnel up")
+            sys.exit(1)
+        print(f"ABORT: Nexus proxy at {profile.get('bedrock.base_url')} is not answering. Staying on current.")
+        sys.exit(1)
+    if target == "nexus":
+        set_nexus(cfg, profile)
+    elif target == "gpt":
+        set_gpt(cfg, profile)
+    elif target == "local":
+        set_local(cfg, profile)
+    else:
+        set_oauth(cfg, profile)
+    bak = cm_settings.save(path, cfg)
+    print(f"Switched {now.upper()} -> {target.upper()}" + (f"   (backup: {os.path.basename(bak)})" if bak else ""))
+    print("Restart your `claude` session (exit + relaunch) to load the new backend.")
+    if target == "oauth":
+        print("If the subscription token aged out, run `claude /login` once — config pins stay intact.")
+    elif target == "gpt":
+        print("GPT mode: opus/sonnet/haiku pair rotation via the Nexus GPT tier")
+    elif target == "local":
+        print(f"Local mode: all roles → {profile.get('models.local.sonnet')} (on-prem vLLM)")
+
+
+def test(profile):
+    """Real round-trip through the currently-active backend via `claude -p`."""
+    import subprocess
+
+    path = cm_settings.settings_path()
+    cfg = cm_settings.load(path)
+    mode = current_mode_detailed(cfg, profile)
+    print(f"Testing active backend ({mode.upper()}) with a live `claude -p` call…")
+    try:
+        out = subprocess.run(
+            ["claude", "-p", "Reply with exactly: OK"],
+            capture_output=True, text=True, timeout=TEST_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        print("  `claude` not on PATH here."); sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"  timed out after {TEST_TIMEOUT_SECONDS}s — backend likely not answering."); sys.exit(1)
+    reply = (out.stdout or "").strip()
+    if out.returncode == 0 and reply:
+        print(f"  OK — backend answered: {reply[:80]!r}")
+    else:
+        print(f"  FAILED (exit {out.returncode}). stderr: {(out.stderr or '').strip()[:300]}")
+        sys.exit(1)
+
+
+def _toggle_next(cur, cycle):
+    if cur not in cycle:
+        return cycle[0] if cycle else "nexus"
+    idx = cycle.index(cur)
+    return cycle[(idx + 1) % len(cycle)]
+
+
+def main():
+    try:
+        profile = Profile()
+    except ProfileError as e:
+        print(f"ABORT: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = (sys.argv[1] if len(sys.argv) > 1 else "status").lower()
+    if cmd in ("status", "st"):
+        status(profile)
+    elif cmd in ("nexus", "bedrock"):
+        switch("nexus", profile)
+    elif cmd in ("gpt", "sol", "luna", "terra"):
+        switch("gpt", profile)
+    elif cmd == "local":
+        switch("local", profile)
+    elif cmd in ("oauth", "claude", "sub", "subscription"):
+        switch("oauth", profile)
+    elif cmd == "toggle":
+        path = cm_settings.settings_path()
+        cfg = cm_settings.load(path)
+        cur = current_mode_detailed(cfg, profile)
+        cycle = profile.get("toggle_cycle")
+        nxt = _toggle_next(cur, cycle)
+        switch(nxt, profile)
+    elif cmd == "test":
+        test(profile)
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+10\.49\.50\.254
+corpintra
+[Mm]ercedes
+\bmbot\b
+\bromello\b
+/opt/claude-shared
+AWS_BEARER_TOKEN_BEDROCK=[^[:space:]]
+sk-[A-Za-z0-9]{16,}
+ANTHROPIC_API_KEY=[^[:space:]]

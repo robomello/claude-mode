@@ -1,0 +1,8 @@
+profiles/*.json
+!profiles/example.json
+*.env
+.env
+*.bak
+__pycache__/
+*.pyc
+.pushed-*

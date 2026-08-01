@@ -1,0 +1,46 @@
+{
+  "bedrock": {
+    "base_url": "http://localhost:8104",
+    "port": 8104
+  },
+  "local": {
+    "base_url": "http://localhost:8901",
+    "port": 8901
+  },
+  "models": {
+    "oauth": {
+      "opus": "claude-opus-4-6",
+      "sonnet": "claude-sonnet-4-6",
+      "haiku": "claude-haiku-4-5",
+      "small_fast": "claude-haiku-4-5"
+    },
+    "nexus": {
+      "opus": "your-opus-model-id",
+      "sonnet": "your-sonnet-model-id",
+      "haiku": "your-haiku-model-id",
+      "small_fast": "your-haiku-model-id"
+    },
+    "gpt": {
+      "opus": "your-gpt-opus-model-id",
+      "sonnet": "your-gpt-sonnet-model-id",
+      "haiku": "your-gpt-haiku-model-id",
+      "small_fast": "your-gpt-haiku-model-id"
+    },
+    "local": {
+      "opus": "your-local-opus-model-id",
+      "sonnet": "your-local-sonnet-model-id",
+      "haiku": "your-local-haiku-model-id",
+      "small_fast": "your-local-haiku-model-id"
+    }
+  },
+  "tokens": {
+    "bedrock_env": "AWS_BEARER_TOKEN_BEDROCK",
+    "gpt_fallback_env": "NEXUS_API_KEY_TEST"
+  },
+  "tunnel": {
+    "host": "your-server.example.com",
+    "user": null,
+    "jump": null
+  },
+  "toggle_cycle": ["oauth", "nexus", "gpt", "local"]
+}

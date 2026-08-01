@@ -1,0 +1,180 @@
+#!/bin/sh
+# claude-mode-tunnel - manage the SSH tunnel to the claude-mode server.
+#
+# Subcommands: up, down, status
+# Exit codes: 0 ok, 1 usage/config error, 2 tunnel not running (status only)
+# POSIX sh - no bash arrays, no BASH_SOURCE - so `sh -n` syntax-checks cleanly
+# on any POSIX shell (dash, ash, bash's sh mode).
+set -eu
+
+_SELF="$(readlink -f "$0")"
+REPO_ROOT="$(cd "$(dirname "$_SELF")/.." && pwd)"
+REPO_LIB="$REPO_ROOT/lib"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-mode"
+PID_FILE="$STATE_DIR/tunnel.pid"
+
+usage() {
+  cat <<'EOF'
+Usage: claude-mode-tunnel <up|down|status> [-h]
+
+  up      Start the SSH tunnel to the configured remote host (no-op if already running).
+  down    Stop the SSH tunnel.
+  status  Report tunnel pid liveness and per-port reachability.
+  -h      Show this help.
+
+Exit codes: 0 ok, 1 usage/config error, 2 tunnel not running (status only)
+EOF
+}
+
+_get() {
+  python3 "$REPO_LIB/profile.py" --get "$1"
+}
+
+_get_optional() {
+  # Prints the value if present, empty string otherwise. Never fails the script.
+  python3 "$REPO_LIB/profile.py" --get "$1" 2>/dev/null || true
+}
+
+_pid_alive() {
+  # $1 = pid
+  kill -0 "$1" 2>/dev/null
+}
+
+_check_port() {
+  # $1 = port, prints "open" or "closed" to stdout
+  python3 - "$1" <<'PYEOF'
+import socket
+import sys
+
+port = int(sys.argv[1])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(("127.0.0.1", port))
+    print("open")
+except Exception:
+    print("closed")
+finally:
+    s.close()
+PYEOF
+}
+
+cmd_up() {
+  mkdir -p "$STATE_DIR"
+
+  if [ -f "$PID_FILE" ]; then
+    _old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "${_old_pid:-}" ] && _pid_alive "$_old_pid"; then
+      echo "claude-mode-tunnel: already running (pid $_old_pid), refusing to start a second tunnel" >&2
+      exit 0
+    fi
+  fi
+
+  host="$(_get tunnel.host)"
+  user="$(_get_optional tunnel.user)"
+  jump="$(_get_optional tunnel.jump)"
+  bedrock_port="$(_get bedrock.port)"
+  vllm_port="$(_get local.port)"
+
+  target="$host"
+  if [ -n "$user" ] && [ "$user" != "None" ] && [ "$user" != "null" ]; then
+    target="${user}@${host}"
+  fi
+
+  # Build the ssh/autossh argument list via positional params (POSIX sh has no arrays).
+  set -- -L "${bedrock_port}:localhost:${bedrock_port}" -L "${vllm_port}:localhost:${vllm_port}"
+  if [ -n "$jump" ] && [ "$jump" != "None" ] && [ "$jump" != "null" ]; then
+    set -- "$@" -J "$jump"
+  fi
+  set -- "$@" "$target"
+
+  if command -v autossh >/dev/null 2>&1; then
+    AUTOSSH_PIDFILE="$PID_FILE" autossh -M 0 -f -N "$@"
+    echo "claude-mode-tunnel: started via autossh (pid file: $PID_FILE)"
+  else
+    ssh -f -N "$@"
+    # ssh -f forks and returns before we can get its pid directly; find it via pgrep
+    # on the exact -L port mapping we just started.
+    _pid="$(pgrep -f "ssh -f -N -L ${bedrock_port}:localhost:${bedrock_port} -L ${vllm_port}:localhost:${vllm_port}" | head -n1 || true)"
+    if [ -z "$_pid" ]; then
+      echo "claude-mode-tunnel: warning - could not determine ssh pid, pidfile not written" >&2
+    else
+      echo "$_pid" > "$PID_FILE"
+    fi
+    echo "claude-mode-tunnel: started via ssh (pid file: $PID_FILE)"
+  fi
+}
+
+cmd_down() {
+  if [ ! -f "$PID_FILE" ]; then
+    echo "claude-mode-tunnel: not running (no pidfile)"
+    return 0
+  fi
+
+  _pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -n "${_pid:-}" ] && _pid_alive "$_pid"; then
+    kill "$_pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  echo "claude-mode-tunnel: stopped"
+}
+
+cmd_status() {
+  bedrock_port="$(_get bedrock.port)"
+  vllm_port="$(_get local.port)"
+
+  running=0
+  if [ -f "$PID_FILE" ]; then
+    _pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "${_pid:-}" ] && _pid_alive "$_pid"; then
+      running=1
+      echo "pid: $_pid (alive)"
+    else
+      echo "pid: stale pidfile ($PID_FILE), process not running"
+    fi
+  else
+    echo "pid: no pidfile"
+  fi
+
+  bedrock_state="$(_check_port "$bedrock_port")"
+  vllm_state="$(_check_port "$vllm_port")"
+  echo "bedrock port ${bedrock_port}: $bedrock_state"
+  echo "local port ${vllm_port}: $vllm_state"
+
+  if [ "$running" -eq 1 ] && [ "$bedrock_state" = "open" ] && [ "$vllm_state" = "open" ]; then
+    exit 0
+  else
+    exit 2
+  fi
+}
+
+main() {
+  if [ "$#" -eq 0 ]; then
+    usage >&2
+    exit 1
+  fi
+
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    up)
+      cmd_up
+      ;;
+    down)
+      cmd_down
+      ;;
+    status)
+      cmd_status
+      ;;
+    *)
+      echo "claude-mode-tunnel: unknown subcommand '$1'" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

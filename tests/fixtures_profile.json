@@ -1,0 +1,46 @@
+{
+  "bedrock": {
+    "base_url": "http://127.0.0.1:8104",
+    "port": 8104
+  },
+  "local": {
+    "base_url": "http://127.0.0.1:8901",
+    "port": 8901
+  },
+  "models": {
+    "oauth": {
+      "opus": "test-oauth-opus",
+      "sonnet": "test-oauth-sonnet",
+      "haiku": "test-oauth-haiku",
+      "small_fast": "test-oauth-haiku"
+    },
+    "nexus": {
+      "opus": "test-nexus-opus",
+      "sonnet": "test-nexus-sonnet",
+      "haiku": "test-nexus-haiku",
+      "small_fast": "test-nexus-haiku"
+    },
+    "gpt": {
+      "opus": "test-gpt-opus",
+      "sonnet": "test-gpt-sonnet",
+      "haiku": "test-gpt-haiku",
+      "small_fast": "test-gpt-haiku"
+    },
+    "local": {
+      "opus": "test-local-model",
+      "sonnet": "test-local-model",
+      "haiku": "test-local-model",
+      "small_fast": "test-local-model"
+    }
+  },
+  "tokens": {
+    "bedrock_env": "TEST_BEARER_TOKEN",
+    "gpt_fallback_env": "TEST_FALLBACK_TOKEN"
+  },
+  "tunnel": {
+    "host": "tunnel.test.invalid",
+    "user": null,
+    "jump": null
+  },
+  "toggle_cycle": ["oauth", "nexus", "gpt", "local"]
+}

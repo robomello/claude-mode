@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Launch Claude Code driven by the GPT tier via the bedrock-proxy,
+# billed to the caller's own unified Nexus key.
+# Engineers running `cc` or plain `claude` are unaffected.
+set -euo pipefail
+
+# Resolve repo root from this script's own path (readlink -f handles symlinked installs).
+_SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_ROOT="$(cd "$(dirname "$_SELF")/.." && pwd)"
+REPO_LIB="$REPO_ROOT/lib"
+
+_get() {
+  python3 "$REPO_LIB/profile.py" --get "$1"
+}
+
+# Route Claude Code through the bedrock-proxy (GPT tier).
+export CLAUDE_CODE_USE_BEDROCK="1"
+export ANTHROPIC_BEDROCK_BASE_URL="${ANTHROPIC_BEDROCK_BASE_URL:-$(_get bedrock.base_url)}"
+
+# Pin GPT deployments (mirror `claude-mode gpt`).
+# ANTHROPIC_MODEL pins the PRIMARY model; without it, -p/default resolution
+# falls back to the literal default sonnet id and never remaps to a GPT id.
+export ANTHROPIC_MODEL="$(_get models.gpt.opus)"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$(_get models.gpt.opus)"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$(_get models.gpt.sonnet)"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$(_get models.gpt.haiku)"
+export ANTHROPIC_SMALL_FAST_MODEL="$(_get models.gpt.small_fast)"
+
+# Caller's own unified key: prefer ~/.env's fallback key var; else fall back to
+# settings.json's bedrock token env var (already exported into this shell if set).
+_bedrock_env="$(_get tokens.bedrock_env)"
+_fallback_env="$(_get tokens.gpt_fallback_env)"
+if [ -f "$HOME/.env" ]; then
+  _k="$(grep -E "^${_fallback_env}=" "$HOME/.env" | head -n1 | cut -d= -f2- | tr -d '"'\''')"
+  if [ -n "$_k" ]; then
+    export "${_bedrock_env}=${_k}"
+  fi
+fi
+
+exec claude "$@"
