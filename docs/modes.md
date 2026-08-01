@@ -108,3 +108,59 @@ Before every write, the previous `settings.json` is copied to
 `settings.json.bak.<timestamp>` (a numeric suffix is appended if two writes
 land in the same second). After each write, backups are pruned to the newest
 10 - older ones are deleted automatically.
+
+## Intentional divergence from the original: exact matching, and an explicit UNKNOWN state
+
+The original single-file script detected `gpt` and `local` mode by **prefix
+match** on the sonnet model id (`sonnet.startswith("gpt-5.6-")`,
+`sonnet.startswith("claude-laguna")`) - reasonable when the id format was a
+hardcoded constant it controlled. This port detects every mode, including
+`nexus`, by **exact equality** against `profile.json`'s
+`models.<mode>.sonnet` instead. This was evaluated as a design fork (prefix
+tolerance vs. strict exact match) and decided deliberately in favor of exact
+match only - no prefix fallback, no fuzzy matching, no warn-and-guess
+variant.
+
+Rationale: a prefix match has no defined meaning once model ids come from an
+arbitrary site profile - there is no shared prefix convention to match
+against in general. More importantly, papering over a mismatch with a guess
+hides profile drift instead of surfacing it. Detection reports each mode
+**positively** - the sonnet id must equal that mode's profile entry, with no
+implicit default - and when nothing matches, it reports an explicit
+`unknown` state rather than silently naming a backend it hasn't confirmed:
+
+```
+Active backend : UNKNOWN (sonnet=gpt-5.6-luna2 matches no profile entry)
+```
+
+Confirmed by direct comparison: a `settings.json` on the GPT route with
+sonnet id `gpt-5.6-luna2` (one character off from the profile's
+`gpt-5.6-luna`) reports `Active backend : GPT` under the original script's
+prefix match, and the UNKNOWN line above under this one. Same shape for a
+local-model near-miss id one point-version off from the profile's exact
+string.
+
+`toggle` reuses the same detection to decide "what is the current mode", and
+never guesses from `unknown` - it aborts (non-zero exit) without touching
+`settings.json`:
+
+```
+ABORT: current backend is UNKNOWN (sonnet=gpt-5.6-luna2 matches no profile entry).
+  toggle will not guess a next mode from an unrecognized state - that would
+  silently switch your backend on a bad guess.
+  Run an explicit `claude-mode <mode>` (oauth/nexus/gpt/local) first, then toggle.
+```
+
+This is the preferred, final behavior, not a limitation awaiting a fix: an
+aborted `toggle` is safe and reversible, while a guessed one is a silent
+backend switch - exactly the failure this design avoids. The accepted cost
+is that a model point-version bump needs a matching one-line `profile.json`
+edit before `status`/`toggle` recognize it again; that's the trade
+deliberately made in exchange for never silently misreporting the active
+backend.
+
+Ways a real settings.json can end up with a non-matching id: a hand-edited
+model id, a profile updated to a newer model id after a switch was already
+made, or a `settings.json` written by the old shared script and then read by
+this one. Keep `profile.json`'s model ids in sync with whatever last wrote
+`settings.json` to avoid landing in `unknown`.

@@ -176,17 +176,21 @@ def set_oauth(cfg, profile):
 
 
 def current_mode_detailed(cfg, profile):
+    """Positively identify the active mode from the sonnet model id. Every
+    mode - including nexus - must match its profile entry exactly. No mode
+    is a default: an id that matches nothing returns "unknown" rather than
+    silently naming a backend it hasn't actually confirmed."""
     env = cfg.get("env", {})
     if env.get(K_USE_BEDROCK) != "1":
         return "oauth"
     sonnet = env.get(K_SONNET, "")
-    gpt_models = profile.get("models.gpt")
-    local_models = profile.get("models.local")
-    if sonnet == gpt_models.get("sonnet"):
+    if sonnet == profile.get("models.nexus").get("sonnet"):
+        return "nexus"
+    if sonnet == profile.get("models.gpt").get("sonnet"):
         return "gpt"
-    if sonnet == local_models.get("sonnet"):
+    if sonnet == profile.get("models.local").get("sonnet"):
         return "local"
-    return "nexus"
+    return "unknown"
 
 
 def gpt_token_source(profile):
@@ -207,7 +211,11 @@ def status(profile):
     cfg = cm_settings.load(path)
     mode = current_mode_detailed(cfg, profile)
     env = cfg.get("env", {})
-    print(f"Active backend : {mode.upper()}")
+    if mode == "unknown":
+        sonnet = env.get(K_SONNET, "")
+        print(f"Active backend : UNKNOWN (sonnet={sonnet} matches no profile entry)")
+    else:
+        print(f"Active backend : {mode.upper()}")
     if mode == "nexus":
         print(f"  route        : Nexus (Claude) via {env.get(K_BASE_URL)}")
         print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
@@ -218,6 +226,8 @@ def status(profile):
         print(f"  route        : local model (vLLM) via {env.get(K_BASE_URL)}")
         print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
         print(f"  local model  : {'up' if local_health_ok(profile) else 'DOWN — not answering'}")
+    elif mode == "unknown":
+        print("  route        : none - unrecognized model id, run `claude-mode <mode>` to set a known state")
     else:
         print("  route        : Claude subscription (OAuth)")
     token_key = profile.get("tokens.bedrock_env")
@@ -323,6 +333,13 @@ def main():
         path = cm_settings.settings_path()
         cfg = cm_settings.load(path)
         cur = current_mode_detailed(cfg, profile)
+        if cur == "unknown":
+            sonnet = cfg.get("env", {}).get(K_SONNET, "")
+            print(f"ABORT: current backend is UNKNOWN (sonnet={sonnet} matches no profile entry).")
+            print("  toggle will not guess a next mode from an unrecognized state - that would")
+            print("  silently switch your backend on a bad guess.")
+            print("  Run an explicit `claude-mode <mode>` (oauth/nexus/gpt/local) first, then toggle.")
+            sys.exit(1)
         cycle = profile.get("toggle_cycle")
         nxt = _toggle_next(cur, cycle)
         switch(nxt, profile)

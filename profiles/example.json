@@ -9,10 +9,10 @@
   },
   "models": {
     "oauth": {
-      "opus": "claude-opus-4-6",
-      "sonnet": "claude-sonnet-4-6",
-      "haiku": "claude-haiku-4-5",
-      "small_fast": "claude-haiku-4-5"
+      "opus": "your-oauth-opus-model-id",
+      "sonnet": "your-oauth-sonnet-model-id",
+      "haiku": "your-oauth-haiku-model-id",
+      "small_fast": "your-oauth-haiku-model-id"
     },
     "nexus": {
       "opus": "your-opus-model-id",

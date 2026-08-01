@@ -142,6 +142,50 @@ class ModeSwitchTests(unittest.TestCase):
         self.cm.set_local(local_cfg, self.profile)
         self.assertEqual(self.cm.current_mode_detailed(local_cfg, self.profile), "local")
 
+    def test_current_mode_detailed_returns_unknown_for_unrecognized_id(self):
+        # gpt-family near-miss: one character off the fixture's exact id
+        gpt_near_miss = self._fresh_cfg({
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "ANTHROPIC_BEDROCK_BASE_URL": "http://127.0.0.1:8104",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "test-gpt-sonnet-2",
+        })
+        self.assertEqual(self.cm.current_mode_detailed(gpt_near_miss, self.profile), "unknown")
+
+        # local-family near-miss
+        local_near_miss = self._fresh_cfg({
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "ANTHROPIC_BEDROCK_BASE_URL": "http://127.0.0.1:8104",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "test-local-model-2",
+        })
+        self.assertEqual(self.cm.current_mode_detailed(local_near_miss, self.profile), "unknown")
+
+    def test_toggle_aborts_from_unknown_state_without_writing_settings(self):
+        unknown_cfg = self._fresh_cfg({
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "ANTHROPIC_BEDROCK_BASE_URL": "http://127.0.0.1:8104",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "test-gpt-sonnet-2",
+        })
+        with open(self.settings_path, "w") as f:
+            json.dump(unknown_cfg, f)
+        with open(self.settings_path, "rb") as f:
+            before = f.read()
+
+        old_argv = list(__import__("sys").argv)
+        __import__("sys").argv = ["claude-mode", "toggle"]
+        self.addCleanup(lambda: setattr(__import__("sys"), "argv", old_argv))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as ctx:
+                self.cm.main()
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn("ABORT", buf.getvalue())
+        self.assertIn("UNKNOWN", buf.getvalue())
+
+        with open(self.settings_path, "rb") as f:
+            after = f.read()
+        self.assertEqual(before, after, "toggle must not write settings.json when starting from UNKNOWN")
+
     def test_switch_end_to_end_via_settings_file(self):
         with open(self.settings_path, "w") as f:
             json.dump(self._fresh_cfg(), f)
