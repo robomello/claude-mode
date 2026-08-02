@@ -25,8 +25,25 @@ SETTINGS_BASENAME = "settings.json"
 MAX_BACKUPS = 10
 
 
+def _home():
+    # CLAUDE_MODE_HOME is a test/automation override. Otherwise honor $HOME
+    # only on POSIX, where the claude CLI itself honors it. On native
+    # Windows the CLI resolves %USERPROFILE% (ntpath.expanduser ignores
+    # $HOME), and this module must edit the same settings.json the CLI
+    # reads - honoring a stray Cygwin/MobaXterm/Emacs $HOME there would
+    # split the two: claude-mode writing one file, claude reading another.
+    override = os.environ.get("CLAUDE_MODE_HOME")
+    if override:
+        return override
+    if os.name != "nt":
+        home = os.environ.get("HOME")
+        if home:
+            return home
+    return os.path.expanduser("~")
+
+
 def settings_path(home=None):
-    home = home if home is not None else os.path.expanduser("~")
+    home = home if home is not None else _home()
     return os.path.join(home, ".claude", SETTINGS_BASENAME)
 
 
@@ -34,7 +51,10 @@ def load(path):
     """Return the parsed settings dict, or {} if the file doesn't exist yet."""
     if not os.path.isfile(path):
         return {}
-    with open(path) as f:
+    # Explicit utf-8: the platform default on Windows is cp1252, which would
+    # silently mis-decode non-ASCII content (em-dashes etc.) and corrupt it
+    # on the next rewrite.
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -72,7 +92,7 @@ def _prune_backups(path, keep=MAX_BACKUPS):
 def _atomic_write(path, cfg):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)

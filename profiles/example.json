@@ -33,9 +33,18 @@
       "small_fast": "your-local-haiku-model-id"
     }
   },
+  "claude_model": {
+    "oauth": null,
+    "nexus": null,
+    "gpt": null,
+    "local": null
+  },
   "tokens": {
     "bedrock_env": "AWS_BEARER_TOKEN_BEDROCK",
-    "gpt_fallback_env": "NEXUS_API_KEY_TEST"
+    "env_file": null
+  },
+  "test": {
+    "timeout_seconds": 20
   },
   "tunnel": {
     "host": "your-server.example.com",

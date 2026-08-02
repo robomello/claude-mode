@@ -39,6 +39,9 @@ class InstalledSymlinkTests(unittest.TestCase):
     def test_status_runs_clean_through_installed_symlink(self):
         env = dict(os.environ)
         env["HOME"] = self.home
+        # HOME alone is ignored on native Windows; CLAUDE_MODE_HOME is the
+        # explicit cross-platform test override.
+        env["CLAUDE_MODE_HOME"] = self.home
         env["CLAUDE_MODE_PROFILE"] = FIXTURE_PROFILE
 
         result = subprocess.run(

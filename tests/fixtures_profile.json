@@ -33,9 +33,15 @@
       "small_fast": "test-local-model"
     }
   },
+  "claude_model": {
+    "oauth": "test-oauth-model-pin",
+    "nexus": null,
+    "gpt": "test-gpt-model-pin",
+    "local": null
+  },
   "tokens": {
     "bedrock_env": "TEST_BEARER_TOKEN",
-    "gpt_fallback_env": "TEST_FALLBACK_TOKEN"
+    "env_file": null
   },
   "tunnel": {
     "host": "tunnel.test.invalid",

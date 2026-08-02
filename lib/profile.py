@@ -7,11 +7,18 @@ Resolution order for any dotted key:
 
 Profile location, in order:
   1. $CLAUDE_MODE_PROFILE (explicit file path override, used by tests)
-  2. $XDG_CONFIG_HOME/claude-mode/profile.json
-  3. ~/.config/claude-mode/profile.json
+  2. ~/.claude/claude-mode/profile.json, if that file exists (preferred:
+     claude-mode's whole job is managing ~/.claude/settings.json, so its
+     profile belongs beside it)
+  3. $XDG_CONFIG_HOME/claude-mode/profile.json or
+     ~/.config/claude-mode/profile.json, if that file exists (legacy)
+When neither file exists, the ~/.claude path is returned as the canonical
+place to create one.
 
-No site-specific values live here. Every default is a generic placeholder;
-real values only ever come from the profile.json a site installs.
+No site-specific values live here. Defaults exist only for keys with a sane
+generic value; keys that need a real site value (model ids under models.*)
+have no default and raise when unresolved. Real values only ever come from
+the profile.json a site installs.
 """
 import copy
 import json
@@ -19,8 +26,10 @@ import os
 from urllib.parse import urlparse
 
 # Generic, non-site-specific defaults. Every dotted key resolvable here needs
-# no profile entry to work, but any real deployment should override models/
-# tokens/tunnel via profile.json.
+# no profile entry to work. Keys with no sane generic value - the real model
+# ids under models.* - are deliberately ABSENT: resolving them without a
+# profile entry must raise ProfileError ("missing required profile key")
+# rather than silently write placeholder ids into settings.json.
 DEFAULTS = {
     "bedrock": {
         "base_url": "http://localhost:8104",
@@ -30,35 +39,18 @@ DEFAULTS = {
         "base_url": "http://localhost:8901",
         "port": 8901,
     },
-    "models": {
-        "oauth": {
-            "opus": "default-opus-model",
-            "sonnet": "default-sonnet-model",
-            "haiku": "default-haiku-model",
-            "small_fast": "default-haiku-model",
-        },
-        "nexus": {
-            "opus": "default-nexus-opus-model",
-            "sonnet": "default-nexus-sonnet-model",
-            "haiku": "default-nexus-haiku-model",
-            "small_fast": "default-nexus-haiku-model",
-        },
-        "gpt": {
-            "opus": "default-gpt-opus-model",
-            "sonnet": "default-gpt-sonnet-model",
-            "haiku": "default-gpt-haiku-model",
-            "small_fast": "default-gpt-haiku-model",
-        },
-        "local": {
-            "opus": "default-local-model",
-            "sonnet": "default-local-model",
-            "haiku": "default-local-model",
-            "small_fast": "default-local-model",
-        },
+    "claude_model": {
+        "oauth": None,
+        "nexus": None,
+        "gpt": None,
+        "local": None,
     },
     "tokens": {
         "bedrock_env": "AWS_BEARER_TOKEN_BEDROCK",
-        "gpt_fallback_env": None,
+        "env_file": None,
+    },
+    "test": {
+        "timeout_seconds": 20,
     },
     "tunnel": {
         "host": None,
@@ -78,13 +70,38 @@ class ProfileError(Exception):
     """Raised for a missing or invalid profile value. str(e) is user-facing."""
 
 
+def _home():
+    # Same resolution as lib/settings.py's _home(): CLAUDE_MODE_HOME
+    # (test/automation override) first; then $HOME, but only on POSIX,
+    # where the claude CLI itself honors it. On native Windows the CLI
+    # resolves %USERPROFILE% (ntpath.expanduser ignores $HOME), so
+    # following a stray Cygwin/MobaXterm $HOME there would point this tool
+    # at a different ~/.claude than the one the CLI actually reads.
+    override = os.environ.get("CLAUDE_MODE_HOME")
+    if override:
+        return override
+    if os.name != "nt":
+        home = os.environ.get("HOME")
+        if home:
+            return home
+    return os.path.expanduser("~")
+
+
 def _profile_path():
     override = os.environ.get("CLAUDE_MODE_PROFILE")
     if override:
         return override
+    claude_path = os.path.join(_home(), ".claude", "claude-mode", "profile.json")
+    if os.path.isfile(claude_path):
+        return claude_path
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = xdg if xdg else os.path.join(os.path.expanduser("~"), ".config")
-    return os.path.join(base, "claude-mode", "profile.json")
+    base = xdg if xdg else os.path.join(_home(), ".config")
+    xdg_path = os.path.join(base, "claude-mode", "profile.json")
+    if os.path.isfile(xdg_path):
+        return xdg_path
+    # Neither file exists yet: report the ~/.claude path as the canonical
+    # place to create one.
+    return claude_path
 
 
 def _deep_merge(base, override):
@@ -149,7 +166,7 @@ class Profile:
         raw = {}
         if os.path.isfile(self.path):
             try:
-                with open(self.path) as f:
+                with open(self.path, encoding="utf-8") as f:
                     raw = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
                 raise ProfileError(f"could not read profile at {self.path}: {e}")

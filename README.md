@@ -19,8 +19,8 @@ Four backends, one command:
 | Mode    | What it routes to |
 |---------|--------------------|
 | `oauth` | Your Claude subscription (OAuth login) |
-| `nexus` | Claude models via your site's Bedrock-compatible proxy |
-| `gpt`   | A GPT-tier deployment via the same proxy |
+| `nexus-claude` | Claude models via your site's Bedrock-compatible proxy |
+| `nexus-gpt`    | GPT-tier Claude Code model IDs via the same proxy |
 | `local` | An on-prem model via the same proxy |
 
 See `docs/modes.md` for exactly what each mode writes to `settings.json` and
@@ -38,9 +38,10 @@ cd claude-mode
 
 - symlinks everything in `bin/` into `~/.local/bin` (skips anything that
   already exists there and isn't a symlink it created)
-- writes `~/.config/claude-mode/profile.json` from `profiles/example.json`
-  **only if that file doesn't already exist** - it never clobbers a profile
-  you've already configured
+- writes an initial `profile.json` from `profiles/example.json` - to
+  `~/.claude/claude-mode/profile.json` when `~/.claude` exists, else to
+  `~/.config/claude-mode/profile.json` - **only if no profile exists in
+  either location** - it never clobbers a profile you've already configured
 - warns (does not fail) if `~/.local/bin` isn't on your `PATH`
 
 Use `--dry-run` to preview every action without writing anything:
@@ -55,8 +56,15 @@ touches `profile.json` or `~/.claude/settings.json`.
 
 ## Profile setup
 
-Edit `~/.config/claude-mode/profile.json` after install. Start from
-`profiles/example.json`'s shape:
+Edit your `profile.json` after install. It is looked for in this order:
+
+1. `$CLAUDE_MODE_PROFILE` (explicit file path override, always wins)
+2. `~/.claude/claude-mode/profile.json`, if it exists (preferred - beside
+   the `settings.json` this tool manages)
+3. `$XDG_CONFIG_HOME/claude-mode/profile.json` or
+   `~/.config/claude-mode/profile.json` (legacy fallback)
+
+Start from `profiles/example.json`'s shape:
 
 ```json
 {
@@ -68,14 +76,23 @@ Edit `~/.config/claude-mode/profile.json` after install. Start from
     "gpt":   { "opus": "...", "sonnet": "...", "haiku": "...", "small_fast": "..." },
     "local": { "opus": "...", "sonnet": "...", "haiku": "...", "small_fast": "..." }
   },
+  "claude_model": { "oauth": null, "nexus": null, "gpt": null, "local": null },
   "tokens": {
     "bedrock_env": "AWS_BEARER_TOKEN_BEDROCK",
-    "gpt_fallback_env": "NEXUS_API_KEY_TEST"
+    "env_file": null
   },
+  "test": { "timeout_seconds": 20 },
   "tunnel": { "host": "your-server.example.com", "user": null, "jump": null },
   "toggle_cycle": ["oauth", "nexus", "gpt", "local"]
 }
 ```
+
+`claude_model.<mode>` optionally pins the top-level `model` key in
+`settings.json` per mode - useful when a model alias set there is only
+valid on one backend. `null` or omitted (the default) means "leave the
+user's `model` key alone". Leaving a pinned mode for an unpinned one
+undoes the pin (restoring your own pre-pin `model` value, if you had one)
+- see `docs/modes.md` for the exact semantics.
 
 Any key you omit falls back to a generic built-in default (see
 `lib/profile.py`'s `DEFAULTS`); a key with no sane generic default (a real
@@ -83,26 +100,39 @@ model ID, a real tunnel host) raises a clear `ABORT: missing required
 profile key: '...'` naming exactly what's missing, instead of silently using
 a placeholder.
 
+`toggle_cycle` entries may use the internal short names (`nexus`, `gpt`) or
+the canonical command names (`nexus-claude`, `nexus-gpt`) - an entry that
+matches no known mode makes `claude-mode toggle` abort instead of guessing.
+
 `$CLAUDE_MODE_PROFILE` overrides the profile file path entirely - useful for
 tests, or running two profiles side by side.
 
 Tokens (Nexus gateway token, etc.) are never stored in `profile.json`. They
-live in `~/.env` (see `docs/modes.md`) and are read fresh on every switch.
+are read fresh on every switch from the first env file that contains the
+key: `~/.claude/.env`, then `~/.env` - or exactly the file named by
+`tokens.env_file` when that profile key is set (see `docs/modes.md`).
 
 ## Usage
 
 ```
 claude-mode status        # show active backend, proxy health, and account
-claude-mode nexus         # route inference through the configured proxy
-claude-mode gpt           # route through the GPT tier
+claude-mode nexus-claude  # Claude models through the configured proxy
+claude-mode nexus-gpt     # GPT-tier models through the same proxy
 claude-mode local         # route to the on-prem model
 claude-mode oauth         # route back to the Claude subscription
 claude-mode toggle        # cycle through profile.json's toggle_cycle
 claude-mode test          # live round-trip through the active backend
 ```
 
-Aliases: `st` for `status`; `bedrock` for `nexus`; `sol`/`luna`/`terra` for
-`gpt`; `claude`/`sub`/`subscription` for `oauth`.
+Aliases: `st` for `status`; `nexus`/`bedrock` for `nexus-claude`;
+`gpt`/`sol`/`luna`/`terra` for `nexus-gpt`; `claude`/`sub`/`subscription` for
+`oauth`.
+
+`nexus-claude` and `nexus-gpt` are both Claude Code modes using the same
+Bedrock-compatible Nexus proxy. They read the same token variable,
+`tokens.bedrock_env` (normally `AWS_BEARER_TOKEN_BEDROCK`), from
+`~/.claude/.env` first, then `~/.env`. The GPT mode changes only the model
+IDs; it does not launch Codex or another CLI.
 
 Restart your `claude` session (exit and relaunch) after switching - the CLI
 reads its environment once at startup.
@@ -111,9 +141,8 @@ Two extra launcher wrappers ship in `bin/`:
 
 - `cc` - launches `claude` pinned to the `oauth` model tier regardless of
   whatever else is currently configured in your shell environment.
-- `cc-gpt` - launches `claude` pinned to the `gpt` tier, billed to your own
-  key (`tokens.gpt_fallback_env` in `~/.env`) rather than whatever's active
-  in `settings.json`.
+- `cc-gpt` - launches `claude` pinned to the `nexus-gpt` tier using the same
+  shared Nexus token as `nexus-claude`.
 
 ## Remote / off-network use
 
@@ -129,22 +158,44 @@ claude-mode-tunnel down     # stop it
 
 ## Troubleshooting
 
-- **`ABORT: no <token> found in ~/.env`** - add the token env var named in
-  the error message to `~/.env` (`KEY=value` form, one per line). `~/.env`
-  should be `chmod 600` and is git-ignored by design; `claude-mode` only
-  ever reads it, never writes it.
-- **`ABORT: <proxy> is not answering`** - the proxy your profile points at is
-  down or unreachable. If `tunnel.host` is set in your profile, the error
-  tells you to run `claude-mode-tunnel up` first.
+- **`ABORT: no <token> found in ...`** - add the token env var named in
+  the error message to one of the files the message lists (`KEY=value`
+  form, one per line; `~/.claude/.env` is searched first, then `~/.env`).
+  That file should be `chmod 600` and is git-ignored by design;
+  `claude-mode` only ever reads it, never writes it. The file must be
+  UTF-8 (a UTF-8 BOM is tolerated) - Windows PowerShell 5.1's
+  `echo 'KEY=...' >> file` writes UTF-16, which `claude-mode` warns about
+  and skips; use `Add-Content -Encoding utf8` or a UTF-8 editor instead.
+- **`ABORT: <proxy> is not answering`** - nothing answered HTTP at the URL
+  your profile points at (an error status like 401/404 counts as
+  answering, so this really means down or unreachable). If `tunnel.host` is
+  set in your profile, the error tells you to run `claude-mode-tunnel up`
+  first.
 - **`ABORT: missing required profile key: '...'`** - that dotted key has no
   generic default and isn't set in your `profile.json`. Add it.
+- **`claude-mode test` times out on a slow machine** - raise
+  `test.timeout_seconds` in your `profile.json` (default 20).
 - **Switch reports success but Claude Code still behaves like the old
   mode** - you didn't restart the session. Exit and relaunch `claude`.
 - **`claude-mode` not found** - `~/.local/bin` isn't on your `PATH`. Add
   `export PATH="$HOME/.local/bin:$PATH"` to your shell rc file.
-- **Windows** - native PowerShell is out of scope; there is no plan to
-  support it. Use WSL or Git Bash, both of which run these scripts unmodified
-  as a normal POSIX/Python environment.
+- **Windows** - the Python CLI itself is OS-agnostic. Under WSL or Git Bash
+  everything runs unmodified as a normal POSIX/Python environment. From
+  native PowerShell/cmd, skip `install.sh` (its symlinks degrade to copies
+  under MSYS bash, so a shim pointing at the repo checkout is preferred)
+  and create a tiny per-user shim, e.g. `~/.local/bin/claude-mode.cmd`:
+
+  ```bat
+  @echo off
+  python "<path-to-repo>\bin\claude-mode" %*
+  ```
+
+  On native Windows, `claude-mode` resolves the same home directory the
+  `claude` CLI does (`%USERPROFILE%`) and deliberately ignores a stray
+  `HOME` env var (Cygwin/MobaXterm/Emacs setups often set one) - otherwise
+  it would edit a `settings.json` the CLI never reads. Set
+  `CLAUDE_MODE_HOME` to force a specific home directory (the test suite
+  uses this).
 
 ## Repo layout
 

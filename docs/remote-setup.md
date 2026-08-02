@@ -2,11 +2,11 @@
 
 If your machine can reach the proxy at `bedrock.base_url` directly (you're on
 the same network the proxy is bound to), you don't need any of this - just
-follow the README's install steps and skip straight to `claude-mode nexus`.
+follow the README's install steps and skip straight to `claude-mode nexus-claude`.
 
 This doc is for everything else: a Mac, a personal Linux box, or a corporate
 laptop that's off the network the proxy actually listens on. In that case
-`claude-mode nexus` / `gpt` / `local` will abort with "proxy is not
+`claude-mode nexus-claude` / `nexus-gpt` / `local` will abort with "proxy is not
 answering" until you bring up an SSH tunnel first.
 
 ## How it works
@@ -19,7 +19,9 @@ behave exactly as if you were on the proxy's own network.
 
 ## One-time profile setup
 
-In `~/.config/claude-mode/profile.json`, fill in the `tunnel` block:
+In your `profile.json` (`~/.claude/claude-mode/profile.json`, or the legacy
+`~/.config/claude-mode/profile.json` - see the README for the resolution
+order), fill in the `tunnel` block:
 
 ```json
 "tunnel": {
@@ -60,12 +62,12 @@ Typical flow on a remote machine:
 
 ```sh
 claude-mode-tunnel up
-claude-mode nexus     # or gpt / local
+claude-mode nexus-claude     # or nexus-gpt / local
 # ... work ...
 claude-mode-tunnel down     # optional - fine to leave it running
 ```
 
-`claude-mode nexus/gpt/local` itself detects a down proxy and, if
+`claude-mode nexus-claude/nexus-gpt/local` itself detects a down proxy and, if
 `tunnel.host` is configured, tells you to run `claude-mode-tunnel up` rather
 than just aborting blind.
 
@@ -87,7 +89,7 @@ than just aborting blind.
   is otherwise harmless, the existing tunnel is still fine to use.
 - **`claude-mode-tunnel status` exits 2** - either the pidfile is stale (ssh
   died) or one of the forwarded ports isn't open yet. `up` again.
-- **Tunnel comes up but `claude-mode nexus` still aborts with "proxy not
+- **Tunnel comes up but `claude-mode nexus-claude` still aborts with "proxy not
   answering"** - check that the ports in `bedrock.base_url`/`local.base_url`
   in your profile actually match the ports `claude-mode-tunnel` forwards
   (`bedrock.port` / `local.port` in the same profile).

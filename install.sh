@@ -55,17 +55,28 @@ for script in "$REPO_ROOT"/bin/*; do
   echo "install.sh: linked $dest -> $script"
 done
 
-CONFIG_DIR="$HOME/.config/claude-mode"
-if [ "$DRY_RUN" -eq 1 ]; then
-  echo "+ mkdir -p $CONFIG_DIR"
-else
-  mkdir -p "$CONFIG_DIR"
-fi
+# Profile resolution mirrors lib/profile.py: ~/.claude/claude-mode/ is the
+# preferred location (beside the settings.json this tool manages), the XDG
+# path is the legacy fallback. Never clobber an existing profile in EITHER.
+CLAUDE_PROFILE="$HOME/.claude/claude-mode/profile.json"
+XDG_PROFILE="${XDG_CONFIG_HOME:-$HOME/.config}/claude-mode/profile.json"
 
-PROFILE_DEST="$CONFIG_DIR/profile.json"
-if [ -f "$PROFILE_DEST" ]; then
-  echo "install.sh: $PROFILE_DEST already exists, leaving it alone"
+if [ -f "$CLAUDE_PROFILE" ]; then
+  echo "install.sh: $CLAUDE_PROFILE already exists, leaving it alone"
+elif [ -f "$XDG_PROFILE" ]; then
+  echo "install.sh: $XDG_PROFILE already exists, leaving it alone"
 else
+  if [ -d "$HOME/.claude" ]; then
+    PROFILE_DEST="$CLAUDE_PROFILE"
+  else
+    PROFILE_DEST="$XDG_PROFILE"
+  fi
+  CONFIG_DIR="$(dirname "$PROFILE_DEST")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "+ mkdir -p $CONFIG_DIR"
+  else
+    mkdir -p "$CONFIG_DIR"
+  fi
   _run cp "$REPO_ROOT/profiles/example.json" "$PROFILE_DEST"
   echo "install.sh: wrote default profile to $PROFILE_DEST"
 fi

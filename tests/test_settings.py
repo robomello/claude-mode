@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from tests._repo import REPO_ROOT  # noqa: F401
 
@@ -25,6 +26,28 @@ class SettingsTests(unittest.TestCase):
     def test_settings_path_honors_home(self):
         p = cm_settings.settings_path(home=self.home)
         self.assertEqual(p, self.path)
+
+    def test_claude_mode_home_override_wins(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_MODE_HOME": self.home,
+                                          "HOME": os.path.join(self.home, "elsewhere")}):
+            self.assertEqual(cm_settings.settings_path(), self.path)
+
+    @unittest.skipUnless(os.name == "nt", "HOME is only ignored on native Windows")
+    def test_home_env_var_ignored_on_native_windows(self):
+        # claude.exe resolves %USERPROFILE% (ntpath.expanduser ignores
+        # $HOME). A stray Cygwin/MobaXterm/Emacs HOME must not make
+        # claude-mode edit a settings.json the CLI never reads.
+        with mock.patch.dict(os.environ, {"HOME": r"D:\weird\home"}):
+            os.environ.pop("CLAUDE_MODE_HOME", None)
+            p = cm_settings.settings_path()
+        self.assertEqual(
+            p, os.path.join(os.path.expanduser("~"), ".claude", "settings.json"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX honors $HOME, matching the CLI")
+    def test_home_env_var_honored_on_posix(self):
+        with mock.patch.dict(os.environ, {"HOME": self.home}):
+            os.environ.pop("CLAUDE_MODE_HOME", None)
+            self.assertEqual(cm_settings.settings_path(), self.path)
 
     def test_load_missing_file_returns_empty_dict(self):
         self.assertEqual(cm_settings.load(os.path.join(self.claude_dir, "nope.json")), {})
@@ -90,6 +113,24 @@ class SettingsTests(unittest.TestCase):
         pattern = os.path.join(self.claude_dir, "settings.json.bak.*")
         backups = glob.glob(pattern)
         self.assertEqual(len(backups), 10)
+
+    def test_non_ascii_content_survives_save_load_round_trip(self):
+        # The file on disk must contain literal UTF-8 bytes, written the way
+        # Claude Code or another tool writes settings.json (ensure_ascii
+        # off) - save() itself emits pure-ASCII escapes, so saving first
+        # would never exercise the decoder. cp1252 (the Windows default
+        # encoding) silently mangles these bytes; explicit utf-8 in load()
+        # is what keeps them intact.
+        note = "em dash — and café, unmanaged"
+        cfg = {"someOtherTool": {"note": note}, "env": {}}
+        with open(self.path, "wb") as f:
+            f.write(json.dumps(cfg, ensure_ascii=False, indent=2).encode("utf-8"))
+        loaded = cm_settings.load(self.path)
+        self.assertEqual(loaded["someOtherTool"]["note"], note)
+        # And a full save/load round trip on top preserves it too.
+        cm_settings.save(self.path, loaded)
+        reloaded = cm_settings.load(self.path)
+        self.assertEqual(reloaded["someOtherTool"]["note"], note)
 
     def test_never_touches_local_credentials_or_account_files(self):
         for name in ("settings.local.json", ".credentials.json"):

@@ -3,8 +3,8 @@
 
 Usage:
   claude-mode status        # show active backend, proxy health, and account
-  claude-mode nexus         # route inference through the Nexus Claude proxy
-  claude-mode gpt           # route through the Nexus GPT tier (opus/sonnet/haiku pairs)
+  claude-mode nexus-claude  # route Claude models through the Nexus proxy
+  claude-mode nexus-gpt     # route GPT models through the Nexus proxy
   claude-mode local         # route to the on-prem local model, via bedrock-proxy
   claude-mode oauth         # route back to the Claude subscription
   claude-mode toggle        # cycle through profile.json's toggle_cycle
@@ -12,13 +12,13 @@ Usage:
 
 Aliases:
   status : st
-  nexus  : bedrock
-  gpt    : sol, luna, terra
+  nexus-claude : nexus, bedrock
+  nexus-gpt    : gpt, sol, luna, terra
   oauth  : claude, sub, subscription
 
 Backends:
-  nexus - Claude models via the configured Nexus proxy
-  gpt   - GPT tier via the same proxy (opus/sonnet/haiku pair rotation)
+  nexus-claude - Claude models via the configured Nexus proxy
+  nexus-gpt    - GPT tier via the same proxy (opus/sonnet/haiku pair rotation)
   local - on-prem model via vLLM, reached through bedrock-proxy
   oauth - Claude subscription (OAuth, newest models)
 
@@ -33,6 +33,7 @@ Restart your `claude` session (exit + relaunch) after switching.
 """
 import os
 import sys
+import urllib.error
 import urllib.request
 
 _BIN_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -43,11 +44,45 @@ if _REPO_ROOT not in sys.path:
 from lib import settings as cm_settings
 from lib.profile import Profile, ProfileError
 
-def _env_file_path():
+def _home():
     # Computed fresh on every call (not a module-level constant) so that
-    # changing $HOME - as tests do, per HOME=$(mktemp -d) - is honored
-    # without needing a re-import.
-    return os.path.join(os.path.expanduser("~"), ".env")
+    # tests pointing CLAUDE_MODE_HOME/$HOME at a temp dir are honored
+    # without needing a re-import. Same resolution as lib/settings.py's
+    # settings_path(): CLAUDE_MODE_HOME (test/automation override) first;
+    # then $HOME, but only on POSIX, where the claude CLI itself honors it.
+    # On native Windows the CLI resolves %USERPROFILE% (ntpath.expanduser
+    # ignores $HOME), and claude-mode must edit the same settings.json the
+    # CLI reads - honoring a stray Cygwin/MobaXterm $HOME there would
+    # silently split the two.
+    override = os.environ.get("CLAUDE_MODE_HOME")
+    if override:
+        return override
+    if os.name != "nt":
+        home = os.environ.get("HOME")
+        if home:
+            return home
+    return os.path.expanduser("~")
+
+
+def _expand_home(path):
+    """expanduser that honors $HOME first, same pattern as
+    lib/settings.py's settings_path() (ntpath.expanduser ignores $HOME)."""
+    if path == "~":
+        return _home()
+    if path.startswith("~/"):
+        return os.path.join(_home(), path[2:])
+    return os.path.expanduser(path)
+
+
+def _env_search_paths(profile):
+    """Env files consulted for tokens, in order. tokens.env_file (when set
+    in the profile) pins the search to exactly that one file; otherwise
+    ~/.claude/.env is consulted first, then ~/.env."""
+    override = profile.get_or("tokens.env_file", None)
+    if isinstance(override, str) and override:
+        return [_expand_home(override)]
+    home = _home()
+    return [os.path.join(home, ".claude", ".env"), os.path.join(home, ".env")]
 
 
 # env var names claude-mode itself manages inside settings.json - unrelated
@@ -67,56 +102,166 @@ MODEL_KEYS = {
 }
 BEDROCK_ENV_KEYS = (K_USE_BEDROCK, K_BASE_URL, K_BEARER)
 
-TEST_TIMEOUT_SECONDS = 20
 HEALTH_TIMEOUT_SECONDS = 4
 
+# Every accepted spelling of a mode -> its canonical internal short name.
+# One source of truth shared by the CLI dispatch and toggle_cycle, so a
+# profile may list either the internal short names ("nexus", "gpt") or the
+# canonical CLI command names ("nexus-claude", "nexus-gpt") - anything else
+# is rejected instead of silently falling through to some other backend.
+MODE_ALIASES = {
+    "oauth": "oauth", "claude": "oauth", "sub": "oauth", "subscription": "oauth",
+    "nexus-claude": "nexus", "nexus": "nexus", "bedrock": "nexus",
+    "nexus-gpt": "gpt", "gpt": "gpt", "sol": "gpt", "luna": "gpt", "terra": "gpt",
+    "local": "local",
+}
 
-def env_lookup(key):
-    """Return value of `key` from ~/.env, or None. Ignores comments/quotes."""
-    try:
-        with open(_env_file_path()) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k.strip() == key:
-                    return v.strip().strip('"').strip("'")
-    except FileNotFoundError:
-        pass
-    return None
+
+def env_lookup(key, profile):
+    """Return (value, path) for `key` from the first searched env file that
+    contains it, or (None, None). Ignores comments/quotes."""
+    for path in _env_search_paths(profile):
+        # utf-8-sig: identical to utf-8 for BOM-less files, but also strips
+        # the BOM that Windows editors (and PowerShell 5.1 redirection)
+        # prepend - a strict utf-8 read leaves it glued to the first line's
+        # key, so a token on line 1 would be reported as MISSING from the
+        # very file that contains it.
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    if k.strip() == key:
+                        return v.strip().strip('"').strip("'"), path
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeDecodeError) as e:
+            # e.g. a UTF-16 file written by PowerShell 5.1's `echo >>` -
+            # skip it with a pointer instead of a traceback.
+            print(f"WARNING: could not read {path} as UTF-8 ({e}); "
+                  "re-save it as UTF-8 (PowerShell 5.1 `echo >>` writes UTF-16).",
+                  file=sys.stderr)
+            continue
+    return None, None
 
 
 def _model_env(profile, mode):
     models = profile.get(f"models.{mode}")
+    missing = [role for role in MODEL_KEYS if not isinstance(models, dict) or role not in models]
+    if missing:
+        # Real model ids have no sane generic default (see lib/profile.py's
+        # DEFAULTS) - a partial models block must abort loudly, never write
+        # a half-updated or placeholder set into settings.json.
+        raise ProfileError(
+            "missing required profile key(s): "
+            + ", ".join(f"'models.{mode}.{role}'" for role in missing)
+        )
     return {MODEL_KEYS[role]: model_id for role, model_id in models.items() if role in MODEL_KEYS}
 
 
-def _http_ok(url, timeout=HEALTH_TIMEOUT_SECONDS):
-    """Cross-platform health probe: plain urllib GET with a short timeout.
-    No shell-outs (`nc`, `timeout`) so this works unmodified on macOS."""
+# Top-level bookkeeping key that lets claude-mode tell its own pin-written
+# "model" value apart from a user-set one, so leaving a pinned mode undoes
+# the pin instead of leaking it onto the next backend. Shape:
+#   {"pinned": "<value claude-mode wrote>", "prior": <user's pre-pin value>}
+# ("prior" is absent when the user had no top-level "model" before the pin.)
+K_PIN_STATE = "claudeModeModelPin"
+
+
+def _apply_model_pin(cfg, profile, mode):
+    """Pin the top-level "model" key from claude_model.<mode>, when the
+    profile sets one. With no pin (null/absent - the default), a user-set
+    "model" is left exactly as-is - but a stale pin written by a previously
+    entered pinned mode is undone (the user's pre-pin value restored, or the
+    key removed if they had none): a pinned alias may only be valid on one
+    backend, so it must never ride along into a mode that didn't pin it.
+    K_PIN_STATE records what claude-mode wrote; a "model" value that no
+    longer matches it was changed by the user and is never touched."""
+    pin = profile.get_or(f"claude_model.{mode}", None)
+    state = cfg.get(K_PIN_STATE)
+    pin_active = isinstance(state, dict) and cfg.get("model") == state.get("pinned")
+    if isinstance(pin, str) and pin:
+        if pin_active:
+            state = dict(state, pinned=pin)  # keep the original "prior"
+        else:
+            state = {"pinned": pin}
+            if "model" in cfg:
+                state["prior"] = cfg["model"]
+        cm_settings.apply_top(cfg, set_top={"model": pin, K_PIN_STATE: state})
+        return
+    if pin_active:
+        if "prior" in state:
+            cm_settings.apply_top(cfg, set_top={"model": state["prior"]}, remove_top=(K_PIN_STATE,))
+        else:
+            cm_settings.apply_top(cfg, remove_top=("model", K_PIN_STATE))
+    elif isinstance(state, dict):
+        # The user overrode the pinned value themselves: their "model" wins,
+        # and the stale bookkeeping is dropped.
+        cm_settings.apply_top(cfg, remove_top=(K_PIN_STATE,))
+
+
+def _http_probe(url, timeout=HEALTH_TIMEOUT_SECONDS):
+    """Cross-platform HTTP probe: plain urllib GET with a short timeout.
+    Returns the HTTP status code the endpoint answered with (any code counts
+    as answering - direct Bedrock-compatible gateways often have no
+    /v1/models route, so an unauthenticated GET comes back 404 or 401 while
+    the endpoint is perfectly reachable), or None if nothing answered at
+    all. No shell-outs (`nc`, `timeout`) so this works unmodified on macOS."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return r.status == 200
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        # An HTTP error status IS an answer. Caught before URLError, which
+        # it subclasses - falling through would misreport it as unreachable.
+        return e.code
     except Exception:
-        return False
+        # URLError, socket timeout, connection refused: nothing answered.
+        return None
+
+
+def _probe_label(status_code):
+    """Human label for a probe result. "up" is reserved for a 2xx: any other
+    HTTP status means something answered - enough for reachability - but a
+    reverse proxy fronting a dead backend answers 502/503, so an error
+    status must not be reported as "up"."""
+    if status_code is None:
+        return "DOWN — not answering"
+    if 200 <= status_code < 300:
+        return "up"
+    return f"answering (HTTP {status_code}) — backend may be down"
+
+
+def proxy_probe(profile):
+    return _http_probe(profile.get("bedrock.base_url").rstrip("/") + "/v1/models")
 
 
 def proxy_ok(profile):
-    return _http_ok(profile.get("bedrock.base_url").rstrip("/") + "/v1/models")
+    """Reachability gate for switching: any HTTP answer counts (see
+    _http_probe) - only a connect failure/timeout aborts a switch."""
+    return proxy_probe(profile) is not None
+
+
+def local_probe(profile):
+    return _http_probe(profile.get("local.base_url").rstrip("/") + "/v1/models")
 
 
 def local_health_ok(profile):
-    """Non-fatal probe of the direct local endpoint. Never blocks the switch."""
-    return _http_ok(profile.get("local.base_url").rstrip("/") + "/v1/models")
+    """Non-fatal health probe of the direct local endpoint: healthy means a
+    2xx from /v1/models. Unlike the reachability gate, an error status
+    (500/502/503 - e.g. a reverse proxy with a dead vLLM behind it) is NOT
+    healthy. Never blocks the switch."""
+    status_code = local_probe(profile)
+    return status_code is not None and 200 <= status_code < 300
 
 
 def set_nexus(cfg, profile):
     token_key = profile.get("tokens.bedrock_env")
-    token = env_lookup(token_key)
+    token, _ = env_lookup(token_key, profile)
     if not token:
-        print(f"ABORT: no {token_key} found in {_env_file_path()}.")
-        print(f"  Add it first, e.g.:  echo '{token_key}=<your-nexus-gateway-token>' >> ~/.env")
+        searched = _env_search_paths(profile)
+        print(f"ABORT: no {token_key} found in {' or '.join(searched)}.")
+        print(f"  Add it first, e.g.:  echo '{token_key}=<your-nexus-gateway-token>' >> {searched[0]}")
         print("  (that file is chmod 600 and stays out of git; the toggle reads it here.)")
         sys.exit(1)
     set_env = {
@@ -127,16 +272,28 @@ def set_nexus(cfg, profile):
     set_env.update(_model_env(profile, "nexus"))
     cm_settings.apply_env(cfg, set_env=set_env)
     cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
+    _apply_model_pin(cfg, profile, "nexus")
 
 
 def set_gpt(cfg, profile):
     token_key = profile.get("tokens.bedrock_env")
-    fallback_key = profile.get_or("tokens.gpt_fallback_env", None)
-    token = env_lookup(token_key) or (env_lookup(fallback_key) if fallback_key else None)
+    # tokens.gpt_fallback_env was removed: both Nexus modes share
+    # tokens.bedrock_env (see docs/modes.md). A profile that still carries
+    # the old key gets a runtime notice instead of being silently ignored.
+    legacy_key = profile.get_or("tokens.gpt_fallback_env", None)
+    if isinstance(legacy_key, str) and legacy_key:
+        print(f"NOTE: profile key tokens.gpt_fallback_env ({legacy_key}) is no longer supported;")
+        print(f"  nexus-gpt and nexus-claude both read tokens.bedrock_env ({token_key}).")
+    token, _ = env_lookup(token_key, profile)
     if not token:
-        names = token_key if not fallback_key else f"{token_key} or {fallback_key}"
-        print(f"ABORT: no {names} found in {_env_file_path()}.")
-        print(f"  Add one, e.g.:  echo '{token_key}=<your-nexus-gateway-token>' >> ~/.env")
+        searched = _env_search_paths(profile)
+        print(f"ABORT: no {token_key} found in {' or '.join(searched)}.")
+        if isinstance(legacy_key, str) and legacy_key:
+            legacy_val, legacy_path = env_lookup(legacy_key, profile)
+            if legacy_val:
+                print(f"  Found the old {legacy_key} in {legacy_path} - copy its value over:")
+                print(f"    echo '{token_key}=<value of {legacy_key}>' >> {legacy_path}")
+        print(f"  Add one, e.g.:  echo '{token_key}=<your-nexus-gateway-token>' >> {searched[0]}")
         sys.exit(1)
     set_env = {
         K_USE_BEDROCK: "1",
@@ -146,18 +303,19 @@ def set_gpt(cfg, profile):
     set_env.update(_model_env(profile, "gpt"))
     cm_settings.apply_env(cfg, set_env=set_env)
     cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
+    _apply_model_pin(cfg, profile, "gpt")
 
 
 def set_local(cfg, profile):
     if not local_health_ok(profile):
-        print(f"WARNING: local model health check failed ({profile.get('local.base_url')} not answering).")
+        print(f"WARNING: local model health check failed ({profile.get('local.base_url')} not answering or returned an error status).")
         print("  Continuing anyway -- the mode switch does not depend on the probe.")
     token_key = profile.get("tokens.bedrock_env")
-    token = env_lookup(token_key)
+    token, _ = env_lookup(token_key, profile)
     if not token:
         # Local still needs a placeholder token for the Bedrock header, but it
         # won't be used to call Nexus (local routing happens before BYOK/Nexus).
-        print(f"NOTE: no {token_key} in ~/.env, using dummy token for local mode (no Nexus calls)")
+        print(f"NOTE: no {token_key} in {' or '.join(_env_search_paths(profile))}, using dummy token for local mode (no Nexus calls)")
         token = "local-bypass"
     set_env = {
         K_USE_BEDROCK: "1",
@@ -167,12 +325,14 @@ def set_local(cfg, profile):
     set_env.update(_model_env(profile, "local"))
     cm_settings.apply_env(cfg, set_env=set_env)
     cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
+    _apply_model_pin(cfg, profile, "local")
 
 
 def set_oauth(cfg, profile):
     set_env = _model_env(profile, "oauth")
     cm_settings.apply_env(cfg, set_env=set_env, remove_env=BEDROCK_ENV_KEYS)
     cm_settings.apply_top(cfg, set_top={"forceLoginMethod": "claudeai"})
+    _apply_model_pin(cfg, profile, "oauth")
 
 
 def current_mode_detailed(cfg, profile):
@@ -193,19 +353,6 @@ def current_mode_detailed(cfg, profile):
     return "unknown"
 
 
-def gpt_token_source(profile):
-    """Which ~/.env var GPT mode resolves its token from, mirroring set_gpt()'s
-    precedence (bedrock_env preferred, gpt_fallback_env fallback).
-    Returns the var name, or None if neither is set."""
-    token_key = profile.get("tokens.bedrock_env")
-    if env_lookup(token_key):
-        return token_key
-    fallback_key = profile.get_or("tokens.gpt_fallback_env", None)
-    if fallback_key and env_lookup(fallback_key):
-        return fallback_key
-    return None
-
-
 def status(profile):
     path = cm_settings.settings_path()
     cfg = cm_settings.load(path)
@@ -215,30 +362,29 @@ def status(profile):
         sonnet = env.get(K_SONNET, "")
         print(f"Active backend : UNKNOWN (sonnet={sonnet} matches no profile entry)")
     else:
-        print(f"Active backend : {mode.upper()}")
+        labels = {"nexus": "NEXUS-CLAUDE", "gpt": "NEXUS-GPT"}
+        print(f"Active backend : {labels.get(mode, mode.upper())}")
     if mode == "nexus":
         print(f"  route        : Nexus (Claude) via {env.get(K_BASE_URL)}")
-        print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
+        print(f"  proxy        : {_probe_label(proxy_probe(profile))}")
     elif mode == "gpt":
         print("  route        : Nexus GPT tier (opus/sonnet/haiku pair rotation)")
-        print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
+        print(f"  proxy        : {_probe_label(proxy_probe(profile))}")
     elif mode == "local":
         print(f"  route        : local model (vLLM) via {env.get(K_BASE_URL)}")
-        print(f"  proxy        : {'up' if proxy_ok(profile) else 'DOWN — not answering'}")
-        print(f"  local model  : {'up' if local_health_ok(profile) else 'DOWN — not answering'}")
+        print(f"  proxy        : {_probe_label(proxy_probe(profile))}")
+        print(f"  local model  : {_probe_label(local_probe(profile))}")
     elif mode == "unknown":
         print("  route        : none - unrecognized model id, run `claude-mode <mode>` to set a known state")
     else:
         print("  route        : Claude subscription (OAuth)")
     token_key = profile.get("tokens.bedrock_env")
-    tok = env_lookup(token_key)
-    print(f"  nexus token  : {'present in ~/.env' if tok else f'MISSING from ~/.env ({token_key}; nexus will abort)'}")
-    if mode == "gpt":
-        src = gpt_token_source(profile)
-        fallback_key = profile.get_or("tokens.gpt_fallback_env", None)
-        need = token_key if not fallback_key else f"{token_key} or {fallback_key}"
-        int_status = f"present ({src})" if src else f"MISSING - need {need}"
-        print(f"  gpt token    : {int_status}")
+    tok, tok_path = env_lookup(token_key, profile)
+    if tok:
+        print(f"  nexus token  : present in {tok_path} (shared by NEXUS-CLAUDE and NEXUS-GPT)")
+    else:
+        searched = " or ".join(_env_search_paths(profile))
+        print(f"  nexus token  : MISSING from {searched} ({token_key}; nexus will abort)")
     print(f"  sonnet       : {env.get(K_SONNET)}")
     print(f"  opus         : {env.get(K_OPUS)}")
     print(f"  haiku        : {env.get(K_HAIKU)}")
@@ -266,8 +412,16 @@ def switch(target, profile):
         set_gpt(cfg, profile)
     elif target == "local":
         set_local(cfg, profile)
-    else:
+    elif target == "oauth":
         set_oauth(cfg, profile)
+    else:
+        # Defensive: every caller canonicalizes through MODE_ALIASES first,
+        # but an unrecognized target must never silently become oauth (that
+        # would write OAUTH settings while printing the wrong mode name AND
+        # skip the proxy reachability gate).
+        print(f"ABORT: unknown mode {target!r} - nothing written.")
+        print("  Valid modes: oauth, nexus-claude (nexus), nexus-gpt (gpt), local.")
+        sys.exit(1)
     bak = cm_settings.save(path, cfg)
     print(f"Switched {now.upper()} -> {target.upper()}" + (f"   (backup: {os.path.basename(bak)})" if bak else ""))
     print("Restart your `claude` session (exit + relaunch) to load the new backend.")
@@ -286,16 +440,19 @@ def test(profile):
     path = cm_settings.settings_path()
     cfg = cm_settings.load(path)
     mode = current_mode_detailed(cfg, profile)
+    # Default 20s; override via profile test.timeout_seconds for slow cold
+    # starts or high-reasoning default models.
+    timeout_seconds = profile.get("test.timeout_seconds")
     print(f"Testing active backend ({mode.upper()}) with a live `claude -p` call…")
     try:
         out = subprocess.run(
             ["claude", "-p", "Reply with exactly: OK"],
-            capture_output=True, text=True, timeout=TEST_TIMEOUT_SECONDS,
+            capture_output=True, text=True, timeout=timeout_seconds,
         )
     except FileNotFoundError:
         print("  `claude` not on PATH here."); sys.exit(1)
     except subprocess.TimeoutExpired:
-        print(f"  timed out after {TEST_TIMEOUT_SECONDS}s — backend likely not answering."); sys.exit(1)
+        print(f"  timed out after {timeout_seconds}s — backend likely not answering."); sys.exit(1)
     reply = (out.stdout or "").strip()
     if out.returncode == 0 and reply:
         print(f"  OK — backend answered: {reply[:80]!r}")
@@ -311,43 +468,54 @@ def _toggle_next(cur, cycle):
     return cycle[(idx + 1) % len(cycle)]
 
 
+def _canon_cycle(profile):
+    """profile.json's toggle_cycle with every entry canonicalized through
+    MODE_ALIASES - so both the internal short names and the CLI command
+    names are valid entries. An unrecognized entry aborts: passing it
+    through verbatim would make switch() silently pick a backend the user
+    never named."""
+    cycle = []
+    for entry in profile.get("toggle_cycle"):
+        canon = MODE_ALIASES.get(str(entry).lower())
+        if canon is None:
+            print(f"ABORT: unrecognized toggle_cycle entry {entry!r} in profile.json.")
+            print("  Valid entries: oauth, nexus-claude (nexus), nexus-gpt (gpt), local.")
+            sys.exit(1)
+        cycle.append(canon)
+    return cycle
+
+
 def main():
     try:
         profile = Profile()
+
+        cmd = (sys.argv[1] if len(sys.argv) > 1 else "status").lower()
+        if cmd in ("status", "st"):
+            status(profile)
+        elif cmd in MODE_ALIASES:
+            switch(MODE_ALIASES[cmd], profile)
+        elif cmd == "toggle":
+            path = cm_settings.settings_path()
+            cfg = cm_settings.load(path)
+            cur = current_mode_detailed(cfg, profile)
+            if cur == "unknown":
+                sonnet = cfg.get("env", {}).get(K_SONNET, "")
+                print(f"ABORT: current backend is UNKNOWN (sonnet={sonnet} matches no profile entry).")
+                print("  toggle will not guess a next mode from an unrecognized state - that would")
+                print("  silently switch your backend on a bad guess.")
+                print("  Run an explicit `claude-mode <mode>` (oauth/nexus-claude/nexus-gpt/local) first, then toggle.")
+                sys.exit(1)
+            cycle = _canon_cycle(profile)
+            nxt = _toggle_next(cur, cycle)
+            switch(nxt, profile)
+        elif cmd == "test":
+            test(profile)
+        else:
+            print(__doc__)
+            sys.exit(2)
     except ProfileError as e:
         print(f"ABORT: {e}", file=sys.stderr)
         sys.exit(1)
-
-    cmd = (sys.argv[1] if len(sys.argv) > 1 else "status").lower()
-    if cmd in ("status", "st"):
-        status(profile)
-    elif cmd in ("nexus", "bedrock"):
-        switch("nexus", profile)
-    elif cmd in ("gpt", "sol", "luna", "terra"):
-        switch("gpt", profile)
-    elif cmd == "local":
-        switch("local", profile)
-    elif cmd in ("oauth", "claude", "sub", "subscription"):
-        switch("oauth", profile)
-    elif cmd == "toggle":
-        path = cm_settings.settings_path()
-        cfg = cm_settings.load(path)
-        cur = current_mode_detailed(cfg, profile)
-        if cur == "unknown":
-            sonnet = cfg.get("env", {}).get(K_SONNET, "")
-            print(f"ABORT: current backend is UNKNOWN (sonnet={sonnet} matches no profile entry).")
-            print("  toggle will not guess a next mode from an unrecognized state - that would")
-            print("  silently switch your backend on a bad guess.")
-            print("  Run an explicit `claude-mode <mode>` (oauth/nexus/gpt/local) first, then toggle.")
-            sys.exit(1)
-        cycle = profile.get("toggle_cycle")
-        nxt = _toggle_next(cur, cycle)
-        switch(nxt, profile)
-    elif cmd == "test":
-        test(profile)
-    else:
-        print(__doc__)
-        sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Launch Claude Code driven by the GPT tier via the bedrock-proxy,
-# billed to the caller's own unified Nexus key.
-# Engineers running `cc` or plain `claude` are unaffected.
+# Launch Claude Code driven by the Nexus GPT tier via the bedrock-proxy,
+# using the same shared Nexus key as the Nexus Claude mode.
+# Engineers running cc or plain claude are unaffected.
 set -euo pipefail
 
 # Resolve repo root from this script's own path (readlink -f handles symlinked installs).
@@ -13,11 +13,11 @@ _get() {
   python3 "$REPO_LIB/profile.py" --get "$1"
 }
 
-# Route Claude Code through the bedrock-proxy (GPT tier).
+# Route Claude Code through the bedrock-proxy (Nexus GPT tier).
 export CLAUDE_CODE_USE_BEDROCK="1"
 export ANTHROPIC_BEDROCK_BASE_URL="${ANTHROPIC_BEDROCK_BASE_URL:-$(_get bedrock.base_url)}"
 
-# Pin GPT deployments (mirror `claude-mode gpt`).
+# Pin GPT deployments (mirror claude-mode nexus-gpt).
 # ANTHROPIC_MODEL pins the PRIMARY model; without it, -p/default resolution
 # falls back to the literal default sonnet id and never remaps to a GPT id.
 export ANTHROPIC_MODEL="$(_get models.gpt.opus)"
@@ -26,15 +26,45 @@ export ANTHROPIC_DEFAULT_SONNET_MODEL="$(_get models.gpt.sonnet)"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$(_get models.gpt.haiku)"
 export ANTHROPIC_SMALL_FAST_MODEL="$(_get models.gpt.small_fast)"
 
-# Caller's own unified key: prefer ~/.env's fallback key var; else fall back to
-# settings.json's bedrock token env var (already exported into this shell if set).
+# Use the same shared Nexus key as claude-mode nexus-claude.
+# Same search order as claude-mode (_env_search_paths): tokens.env_file,
+# when set in the profile, pins the search to exactly that one file;
+# otherwise ~/.claude/.env first, then ~/.env - the first file containing
+# the key wins.
 _bedrock_env="$(_get tokens.bedrock_env)"
-_fallback_env="$(_get tokens.gpt_fallback_env)"
-if [ -f "$HOME/.env" ]; then
-  _k="$(grep -E "^${_fallback_env}=" "$HOME/.env" | head -n1 | cut -d= -f2- | tr -d '"'\''')"
+# tokens.gpt_fallback_env was removed: both Nexus modes share
+# tokens.bedrock_env. Surface a profile that still carries the old key
+# instead of silently ignoring it.
+_legacy_env="$(_get tokens.gpt_fallback_env 2>/dev/null || true)"
+if [ -n "$_legacy_env" ]; then
+  echo "cc-gpt: NOTE: profile key tokens.gpt_fallback_env ($_legacy_env) is no longer supported;" >&2
+  echo "cc-gpt:   only tokens.bedrock_env ($_bedrock_env) is read - move that token's value over." >&2
+fi
+_env_file_override="$(_get tokens.env_file)"
+_env_search=("$HOME/.claude/.env" "$HOME/.env")
+if [ -n "$_env_file_override" ]; then
+  case "$_env_file_override" in
+    "~") _env_file_override="$HOME" ;;
+    "~/"*) _env_file_override="$HOME/${_env_file_override#\~/}" ;;
+  esac
+  _env_search=("$_env_file_override")
+fi
+for _envfile in "${_env_search[@]}"; do
+  [ -f "$_envfile" ] || continue
+  _k="$(grep -E "^${_bedrock_env}=" "$_envfile" | head -n1 | cut -d= -f2- | tr -d "\"'" || true)"
   if [ -n "$_k" ]; then
-    export "${_bedrock_env}=${_k}"
+    export "${_bedrock_env}=$_k"
+    break
   fi
+done
+
+# Never exec claude with no token at all - the Nexus GPT tier can't answer
+# without one, and a launch that silently proceeds just fails later with a
+# far less obvious error. A token already exported in the environment counts.
+if [ -z "${!_bedrock_env:-}" ]; then
+  echo "cc-gpt: ABORT: no ${_bedrock_env} found in ${_env_search[*]} (or already exported)." >&2
+  echo "cc-gpt:   Add it, e.g.:  echo '${_bedrock_env}=<your-nexus-gateway-token>' >> ${_env_search[0]}" >&2
+  exit 1
 fi
 
 exec claude "$@"

@@ -1,11 +1,12 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
 from tests._repo import REPO_ROOT  # noqa: F401 ensures repo root on sys.path
 
-from lib.profile import Profile, ProfileError, DEFAULTS
+from lib.profile import Profile, ProfileError, DEFAULTS, _profile_path
 
 
 class ProfileTests(unittest.TestCase):
@@ -64,8 +65,28 @@ class ProfileTests(unittest.TestCase):
         # everything else falls back to the built-in generic default
         self.assertEqual(prof.get("bedrock.base_url"), DEFAULTS["bedrock"]["base_url"])
         self.assertEqual(prof.get("bedrock.port"), DEFAULTS["bedrock"]["port"])
-        self.assertEqual(prof.get("models.oauth.opus"), DEFAULTS["models"]["oauth"]["opus"])
         self.assertEqual(prof.get("toggle_cycle"), DEFAULTS["toggle_cycle"])
+
+    def test_model_ids_have_no_generic_default(self):
+        # A real model ID has no sane generic value: resolving one without a
+        # profile entry must raise, naming the key - never hand back a
+        # placeholder that would get written into settings.json.
+        prof = Profile(path=self._write({}))
+        with self.assertRaises(ProfileError) as ctx:
+            prof.get("models.oauth.opus")
+        self.assertIn("models.oauth.opus", str(ctx.exception))
+        with self.assertRaises(ProfileError):
+            prof.get("models.nexus.sonnet")
+
+    def test_missing_profile_file_leaves_model_ids_unresolved(self):
+        # A lost/unfound profile.json must not silently resolve to
+        # placeholder model ids (the file simply not being found is exactly
+        # the failure this guards against).
+        missing_path = os.path.join(tempfile.mkdtemp(), "does-not-exist.json")
+        prof = Profile(path=missing_path)
+        with self.assertRaises(ProfileError) as ctx:
+            prof.get("models.nexus.sonnet")
+        self.assertIn("models.nexus.sonnet", str(ctx.exception))
 
     def test_missing_profile_file_uses_pure_defaults(self):
         missing_path = os.path.join(tempfile.mkdtemp(), "does-not-exist.json")
@@ -83,6 +104,14 @@ class ProfileTests(unittest.TestCase):
         path = self._write({})
         prof = Profile(path=path)
         self.assertIsNone(prof.get("tunnel.host"))
+
+    def test_test_timeout_default_and_override(self):
+        # default resolves from DEFAULTS...
+        prof = Profile(path=self._write({}))
+        self.assertEqual(prof.get("test.timeout_seconds"), 20)
+        # ...and a profile override wins.
+        prof = Profile(path=self._write({"test": {"timeout_seconds": 45}}))
+        self.assertEqual(prof.get("test.timeout_seconds"), 45)
 
     def test_cli_get_prints_value_and_exits_zero(self):
         import subprocess
@@ -111,6 +140,68 @@ class ProfileTests(unittest.TestCase):
         )
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("totally.missing.key", out.stderr)
+
+
+class ProfilePathTests(unittest.TestCase):
+    """Resolution order of _profile_path(): env override, then
+    ~/.claude/claude-mode/, then the XDG path, with the ~/.claude path as
+    the canonical answer when neither file exists yet."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="claude-mode-test-home-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self._saved = {
+            key: os.environ.get(key)
+            for key in ("HOME", "CLAUDE_MODE_HOME", "XDG_CONFIG_HOME", "CLAUDE_MODE_PROFILE")
+        }
+        self.addCleanup(self._restore_env)
+        os.environ["HOME"] = self.home
+        # HOME alone is ignored on native Windows (claude-mode follows the
+        # CLI's %USERPROFILE% there); CLAUDE_MODE_HOME is the explicit
+        # cross-platform test override.
+        os.environ["CLAUDE_MODE_HOME"] = self.home
+        os.environ.pop("XDG_CONFIG_HOME", None)
+        os.environ.pop("CLAUDE_MODE_PROFILE", None)
+        self.claude_profile = os.path.join(self.home, ".claude", "claude-mode", "profile.json")
+        self.xdg_profile = os.path.join(self.home, ".config", "claude-mode", "profile.json")
+
+    def _restore_env(self):
+        for key, val in self._saved.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+
+    def _touch(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("{}")
+
+    def test_env_override_always_wins(self):
+        self._touch(self.claude_profile)
+        self._touch(self.xdg_profile)
+        os.environ["CLAUDE_MODE_PROFILE"] = "/explicit/override.json"
+        self.assertEqual(_profile_path(), "/explicit/override.json")
+
+    def test_claude_path_preferred_when_it_exists(self):
+        self._touch(self.claude_profile)
+        self._touch(self.xdg_profile)
+        self.assertEqual(_profile_path(), self.claude_profile)
+
+    def test_xdg_fallback_when_only_it_exists(self):
+        self._touch(self.xdg_profile)
+        self.assertEqual(_profile_path(), self.xdg_profile)
+
+    def test_xdg_config_home_env_respected(self):
+        xdg_base = tempfile.mkdtemp(prefix="claude-mode-test-xdg-")
+        self.addCleanup(shutil.rmtree, xdg_base, ignore_errors=True)
+        os.environ["XDG_CONFIG_HOME"] = xdg_base
+        custom_xdg = os.path.join(xdg_base, "claude-mode", "profile.json")
+        self._touch(custom_xdg)
+        self.assertEqual(_profile_path(), custom_xdg)
+
+    def test_claude_path_is_canonical_when_neither_exists(self):
+        self.assertEqual(_profile_path(), self.claude_profile)
 
 
 if __name__ == "__main__":
