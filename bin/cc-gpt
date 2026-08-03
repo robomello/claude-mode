@@ -9,8 +9,10 @@ _SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "$_SELF")/.." && pwd)"
 REPO_LIB="$REPO_ROOT/lib"
 
+. "$REPO_LIB/python.sh"
+
 _get() {
-  python3 "$REPO_LIB/profile.py" --get "$1"
+  "$PYTHON" "$REPO_LIB/profile.py" --get "$1"
 }
 
 # Route Claude Code through the bedrock-proxy (Nexus GPT tier).

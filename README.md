@@ -36,13 +36,19 @@ cd claude-mode
 
 `install.sh` is idempotent:
 
-- symlinks everything in `bin/` into `~/.local/bin` (skips anything that
-  already exists there and isn't a symlink it created)
+- puts everything in `bin/` into `~/.local/bin`, pointing back at this
+  checkout, so `git pull` is the only update step you ever need. On macOS,
+  Linux and WSL that's a symlink; on Windows see below. Anything already at
+  the destination that install.sh didn't create is left alone with a warning.
 - writes an initial `profile.json` from `profiles/example.json` - to
   `~/.claude/claude-mode/profile.json` when `~/.claude` exists, else to
   `~/.config/claude-mode/profile.json` - **only if no profile exists in
   either location** - it never clobbers a profile you've already configured
 - warns (does not fail) if `~/.local/bin` isn't on your `PATH`
+
+The starter profile is a **template, not a working config** - its model IDs
+and URLs are placeholders. Edit it before your first `claude-mode` run; see
+[Profile setup](#profile-setup).
 
 Use `--dry-run` to preview every action without writing anything:
 
@@ -50,9 +56,25 @@ Use `--dry-run` to preview every action without writing anything:
 ./install.sh --dry-run
 ```
 
-`uninstall.sh` removes only the symlinks `install.sh` created (it verifies
-each symlink still points into this repo before removing it) and never
-touches `profile.json` or `~/.claude/settings.json`.
+`uninstall.sh` removes only what `install.sh` created (it verifies each entry
+still points into this repo before removing it) and never touches
+`profile.json` or `~/.claude/settings.json`.
+
+### Windows
+
+Run `install.sh` from **Git Bash** or MSYS2 - it needs a POSIX shell and
+`cygpath`, both of which Git Bash ships. It detects native Windows and adapts:
+
+- instead of symlinks (Git Bash's `ln -s` silently *copies*, which would
+  freeze your install at the current commit) it writes a launcher pair per
+  script - `claude-mode` for Git Bash and `claude-mode.cmd` for
+  PowerShell/cmd - each exec'ing the script out of this checkout
+- it resolves `~` the way the Python CLI does (`%USERPROFILE%`), **not** from
+  `$HOME`, which Git Bash often points at a network share - so `profile.json`
+  lands where `claude-mode` will actually read it
+
+WSL is not native Windows: there everything installs as a normal POSIX
+environment, symlinks and all.
 
 ## Profile setup
 
@@ -203,17 +225,17 @@ claude-mode-tunnel down     # stop it
   mode** - you didn't restart the session. Exit and relaunch `claude`.
 - **`claude-mode` not found** - `~/.local/bin` isn't on your `PATH`. Add
   `export PATH="$HOME/.local/bin:$PATH"` to your shell rc file.
-- **Windows** - the Python CLI itself is OS-agnostic. Under WSL or Git Bash
-  everything runs unmodified as a normal POSIX/Python environment. From
-  native PowerShell/cmd, skip `install.sh` (its symlinks degrade to copies
-  under MSYS bash, so a shim pointing at the repo checkout is preferred)
-  and create a tiny per-user shim, e.g. `~/.local/bin/claude-mode.cmd`:
-
-  ```bat
-  @echo off
-  python "<path-to-repo>\bin\claude-mode" %*
-  ```
-
+- **Windows: `claude-mode` not found in PowerShell/cmd** - run `install.sh`
+  from Git Bash (see [Windows](#windows) under Install); it generates the
+  `.cmd` launchers PowerShell needs. `~/.local/bin` still has to be on your
+  Windows `PATH`.
+- **Windows: `python3` "not found" / Microsoft Store nag** - that's the Store
+  app-execution alias shadowing a real interpreter. Every entry point probes
+  `python3 --version` and falls back to `python`, so a working `python` is
+  enough; if neither runs, install Python 3 or turn the alias off under
+  Settings > Apps > Advanced app settings > App execution aliases.
+- **Windows** - the Python CLI itself is OS-agnostic; under WSL everything
+  runs unmodified as a normal POSIX environment.
   On native Windows, `claude-mode` resolves the same home directory the
   `claude` CLI does (`%USERPROFILE%`) and deliberately ignores a stray
   `HOME` env var (Cygwin/MobaXterm/Emacs setups often set one) - otherwise
@@ -226,6 +248,7 @@ claude-mode-tunnel down     # stop it
 ```
 bin/        the installed commands (claude-mode, claude-mode-tunnel, cc, cc-gpt)
 lib/        shared Python modules: profile loading, settings.json I/O, platform detection
+            plus python.sh, the interpreter probe every shell entry point sources
 profiles/   profiles/example.json - the template install.sh copies from
 tests/      unittest suite (`make test`)
 install.sh / uninstall.sh

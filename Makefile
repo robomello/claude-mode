@@ -1,12 +1,24 @@
 .PHONY: check test scrub shellcheck-syntax pycompile unittest
 
+# Same interpreter resolution as lib/python.sh: prefer python3, but fall back to
+# python where python3 is only the Microsoft Store alias stub (Windows Git Bash).
+PY := $(shell if python3 --version >/dev/null 2>&1; then echo python3; \
+	elif python --version >/dev/null 2>&1; then echo python; \
+	else echo python3; fi)
+
 check: shellcheck-syntax pycompile unittest scrub
 
 shellcheck-syntax:
-	@echo "== syntax-check scripts, dispatched on shebang =="
+	@echo "== syntax-check scripts, dispatched on extension then shebang =="
 	@status=0; \
-	for f in bin/* install.sh uninstall.sh; do \
+	for f in bin/* install.sh uninstall.sh lib/*.sh; do \
 		[ -f "$$f" ] || continue; \
+		case "$$f" in \
+			*.sh) \
+				echo "-- $$f (sh -n)"; \
+				sh -n "$$f" || status=1; \
+				continue ;; \
+		esac; \
 		shebang="$$(head -n1 "$$f")"; \
 		case "$$shebang" in \
 			*python*) \
@@ -24,12 +36,12 @@ shellcheck-syntax:
 	exit $$status
 
 pycompile:
-	@echo "== python3 -m compileall lib bin =="
-	python3 -m compileall -q lib bin
+	@echo "== $(PY) -m compileall lib bin =="
+	$(PY) -m compileall -q lib bin
 
 unittest:
-	@echo "== python3 -m unittest discover -s tests =="
-	python3 -m unittest discover -s tests -v
+	@echo "== $(PY) -m unittest discover -s tests =="
+	$(PY) -m unittest discover -s tests -v
 
 test: unittest
 

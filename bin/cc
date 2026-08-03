@@ -10,8 +10,10 @@ _SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_ROOT="$(cd "$(dirname "$_SELF")/.." && pwd)"
 REPO_LIB="$REPO_ROOT/lib"
 
+. "$REPO_LIB/python.sh"
+
 _get() {
-  python3 "$REPO_LIB/profile.py" --get "$1"
+  "$PYTHON" "$REPO_LIB/profile.py" --get "$1"
 }
 
 export ANTHROPIC_DEFAULT_OPUS_MODEL="${ANTHROPIC_DEFAULT_OPUS_MODEL:-$(_get models.oauth.opus)}"

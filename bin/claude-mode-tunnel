@@ -27,18 +27,7 @@ Exit codes: 0 ok, 1 usage/config error, 2 tunnel not running (status only)
 EOF
 }
 
-# Resolve a real Python interpreter once. `python3` is preferred (the norm
-# on macOS/Linux), but on Windows Git Bash it commonly resolves to the
-# Microsoft Store's app-execution-alias stub - present on PATH (so
-# `command -v` finds it) but exits non-zero and prints an install nag
-# instead of running. Falling back to `python` there matches what the rest
-# of claude-mode already does on Windows (bin/claude-mode itself is invoked
-# as `python`, not `python3`, by its Windows launcher shims).
-if python3 --version >/dev/null 2>&1; then
-  PYTHON=python3
-else
-  PYTHON=python
-fi
+. "$REPO_LIB/python.sh"
 
 _get() {
   "$PYTHON" "$REPO_LIB/profile.py" --get "$1"
