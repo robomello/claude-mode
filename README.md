@@ -21,7 +21,7 @@ Four backends, one command:
 | `oauth` | Your Claude subscription (OAuth login) |
 | `nexus-claude` | Claude models via your site's Bedrock-compatible proxy |
 | `nexus-gpt`    | GPT-tier Claude Code model IDs via the same proxy |
-| `local` | An on-prem model via the same proxy |
+| `local` | An on-prem model, via the same proxy or direct (`local.transport`) |
 
 See `docs/modes.md` for exactly what each mode writes to `settings.json` and
 why.
@@ -69,7 +69,8 @@ Start from `profiles/example.json`'s shape:
 ```json
 {
   "bedrock": { "base_url": "http://localhost:8104", "port": 8104 },
-  "local":   { "base_url": "http://localhost:8901", "port": 8901 },
+  "local":   { "base_url": "http://localhost:8901", "port": 8901,
+               "transport": "bedrock" },
   "models": {
     "oauth": { "opus": "...", "sonnet": "...", "haiku": "...", "small_fast": "..." },
     "nexus": { "opus": "...", "sonnet": "...", "haiku": "...", "small_fast": "..." },
@@ -93,6 +94,29 @@ valid on one backend. `null` or omitted (the default) means "leave the
 user's `model` key alone". Leaving a pinned mode for an unpinned one
 undoes the pin (restoring your own pre-pin `model` value, if you had one)
 - see `docs/modes.md` for the exact semantics.
+
+`local.transport` picks how `local` mode reaches the on-prem model:
+
+- `"bedrock"` (the default, and the only behavior before this key existed)
+  routes it through the Bedrock-compatible proxy, exactly like the `nexus`
+  modes. Profiles written before this key keep working with no edit.
+- `"direct"` points `ANTHROPIC_BASE_URL` straight at `local.base_url`, for a
+  server that already speaks the Anthropic Messages API natively - no proxy
+  and no Bedrock emulation in between.
+
+Ollama serves that API at `/v1/messages`, so pointing `local` at a machine's
+own Ollama is just:
+
+```json
+"local":  { "base_url": "http://localhost:11434", "transport": "direct" },
+"models": { "local": { "opus": "llama3.2:1b", "sonnet": "llama3.2:1b",
+                       "haiku": "llama3.2:1b", "small_fast": "llama3.2:1b" } }
+```
+
+No token is needed on that path, and no tunnel - `claude-mode local` gates on
+the local endpoint itself rather than on the proxy. Switching to any other
+mode tears the direct keys back down, so a stale `ANTHROPIC_BASE_URL` can
+never leave a later backend pointed at the local server.
 
 Any key you omit falls back to a generic built-in default (see
 `lib/profile.py`'s `DEFAULTS`); a key with no sane generic default (a real
@@ -118,7 +142,7 @@ key: `~/.claude/.env`, then `~/.env` - or exactly the file named by
 claude-mode status        # show active backend, proxy health, and account
 claude-mode nexus-claude  # Claude models through the configured proxy
 claude-mode nexus-gpt     # GPT-tier models through the same proxy
-claude-mode local         # route to the on-prem model
+claude-mode local         # route to the on-prem model (proxied or direct)
 claude-mode oauth         # route back to the Claude subscription
 claude-mode toggle        # cycle through profile.json's toggle_cycle
 claude-mode test          # live round-trip through the active backend

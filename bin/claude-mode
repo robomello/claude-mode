@@ -5,7 +5,7 @@ Usage:
   claude-mode status        # show active backend, proxy health, and account
   claude-mode nexus-claude  # route Claude models through the Nexus proxy
   claude-mode nexus-gpt     # route GPT models through the Nexus proxy
-  claude-mode local         # route to the on-prem local model, via bedrock-proxy
+  claude-mode local         # route to the on-prem local model
   claude-mode oauth         # route back to the Claude subscription
   claude-mode toggle        # cycle through profile.json's toggle_cycle
   claude-mode test          # live round-trip through the active backend
@@ -19,7 +19,7 @@ Aliases:
 Backends:
   nexus-claude - Claude models via the configured Nexus proxy
   nexus-gpt    - GPT tier via the same proxy (opus/sonnet/haiku pair rotation)
-  local - on-prem model via vLLM, reached through bedrock-proxy
+  local - on-prem model, through bedrock-proxy or direct (local.transport)
   oauth - Claude subscription (OAuth, newest models)
 
 All site-specific values (proxy URLs, ports, model IDs, tunnel host, token
@@ -90,6 +90,8 @@ def _env_search_paths(profile):
 K_USE_BEDROCK = "CLAUDE_CODE_USE_BEDROCK"
 K_BASE_URL = "ANTHROPIC_BEDROCK_BASE_URL"
 K_BEARER = "AWS_BEARER_TOKEN_BEDROCK"
+K_ANTHROPIC_BASE = "ANTHROPIC_BASE_URL"
+K_AUTH_TOKEN = "ANTHROPIC_AUTH_TOKEN"
 K_SONNET = "ANTHROPIC_DEFAULT_SONNET_MODEL"
 K_OPUS = "ANTHROPIC_DEFAULT_OPUS_MODEL"
 K_HAIKU = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
@@ -101,6 +103,7 @@ MODEL_KEYS = {
     "small_fast": K_SMALL_FAST,
 }
 BEDROCK_ENV_KEYS = (K_USE_BEDROCK, K_BASE_URL, K_BEARER)
+LOCAL_ENV_KEYS = (K_ANTHROPIC_BASE, K_AUTH_TOKEN)
 
 HEALTH_TIMEOUT_SECONDS = 4
 
@@ -115,6 +118,17 @@ MODE_ALIASES = {
     "nexus-gpt": "gpt", "gpt": "gpt", "sol": "gpt", "luna": "gpt", "terra": "gpt",
     "local": "local",
 }
+
+
+def _bedrock_base_url(profile, mode):
+    """Resolve the Bedrock-compatible base_url a given mode should use.
+    Modes normally share one proxy (bedrock.base_url), but a site may need a
+    mode to hit a different endpoint - e.g. nexus-claude going straight to a
+    gateway that natively serves Claude ids, while nexus-gpt still needs a
+    translating proxy in front of it. bedrock.<mode>_base_url overrides the
+    shared default for exactly that one mode; every mode with no override
+    keeps behaving exactly as before this existed."""
+    return profile.get_or(f"bedrock.{mode}_base_url", None) or profile.get("bedrock.base_url")
 
 
 def env_lookup(key, profile):
@@ -232,14 +246,14 @@ def _probe_label(status_code):
     return f"answering (HTTP {status_code}) — backend may be down"
 
 
-def proxy_probe(profile):
-    return _http_probe(profile.get("bedrock.base_url").rstrip("/") + "/v1/models")
+def proxy_probe(profile, mode):
+    return _http_probe(_bedrock_base_url(profile, mode).rstrip("/") + "/v1/models")
 
 
-def proxy_ok(profile):
+def proxy_ok(profile, mode):
     """Reachability gate for switching: any HTTP answer counts (see
     _http_probe) - only a connect failure/timeout aborts a switch."""
-    return proxy_probe(profile) is not None
+    return proxy_probe(profile, mode) is not None
 
 
 def local_probe(profile):
@@ -266,11 +280,11 @@ def set_nexus(cfg, profile):
         sys.exit(1)
     set_env = {
         K_USE_BEDROCK: "1",
-        K_BASE_URL: profile.get("bedrock.base_url"),
+        K_BASE_URL: _bedrock_base_url(profile, "nexus"),
         K_BEARER: token,
     }
     set_env.update(_model_env(profile, "nexus"))
-    cm_settings.apply_env(cfg, set_env=set_env)
+    cm_settings.apply_env(cfg, set_env=set_env, remove_env=LOCAL_ENV_KEYS)
     cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
     _apply_model_pin(cfg, profile, "nexus")
 
@@ -297,19 +311,41 @@ def set_gpt(cfg, profile):
         sys.exit(1)
     set_env = {
         K_USE_BEDROCK: "1",
-        K_BASE_URL: profile.get("bedrock.base_url"),
+        K_BASE_URL: _bedrock_base_url(profile, "gpt"),
         K_BEARER: token,
     }
     set_env.update(_model_env(profile, "gpt"))
-    cm_settings.apply_env(cfg, set_env=set_env)
+    cm_settings.apply_env(cfg, set_env=set_env, remove_env=LOCAL_ENV_KEYS)
     cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
     _apply_model_pin(cfg, profile, "gpt")
+
+
+def local_transport(profile):
+    """"bedrock" (default) - the local model sits behind the Bedrock-compatible
+    proxy, same wire path as the nexus modes. "direct" - local.base_url already
+    speaks the Anthropic Messages API natively (e.g. Ollama), so the CLI talks
+    to it straight, with no proxy and no Bedrock emulation in between."""
+    return profile.get("local.transport")
 
 
 def set_local(cfg, profile):
     if not local_health_ok(profile):
         print(f"WARNING: local model health check failed ({profile.get('local.base_url')} not answering or returned an error status).")
         print("  Continuing anyway -- the mode switch does not depend on the probe.")
+    if local_transport(profile) == "direct":
+        # No proxy in the path, so there is no Bedrock header to fill and no
+        # token to look up. The dummy auth token is still set so the CLI never
+        # falls back to sending real OAuth/Nexus credentials to the local
+        # endpoint; servers on this path ignore auth entirely.
+        set_env = {
+            K_ANTHROPIC_BASE: profile.get("local.base_url"),
+            K_AUTH_TOKEN: "local-direct",
+        }
+        set_env.update(_model_env(profile, "local"))
+        cm_settings.apply_env(cfg, set_env=set_env, remove_env=BEDROCK_ENV_KEYS)
+        cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
+        _apply_model_pin(cfg, profile, "local")
+        return
     token_key = profile.get("tokens.bedrock_env")
     token, _ = env_lookup(token_key, profile)
     if not token:
@@ -319,18 +355,18 @@ def set_local(cfg, profile):
         token = "local-bypass"
     set_env = {
         K_USE_BEDROCK: "1",
-        K_BASE_URL: profile.get("bedrock.base_url"),
+        K_BASE_URL: _bedrock_base_url(profile, "local"),
         K_BEARER: token,
     }
     set_env.update(_model_env(profile, "local"))
-    cm_settings.apply_env(cfg, set_env=set_env)
+    cm_settings.apply_env(cfg, set_env=set_env, remove_env=LOCAL_ENV_KEYS)
     cm_settings.apply_top(cfg, remove_top=("forceLoginMethod",))
     _apply_model_pin(cfg, profile, "local")
 
 
 def set_oauth(cfg, profile):
     set_env = _model_env(profile, "oauth")
-    cm_settings.apply_env(cfg, set_env=set_env, remove_env=BEDROCK_ENV_KEYS)
+    cm_settings.apply_env(cfg, set_env=set_env, remove_env=BEDROCK_ENV_KEYS + LOCAL_ENV_KEYS)
     cm_settings.apply_top(cfg, set_top={"forceLoginMethod": "claudeai"})
     _apply_model_pin(cfg, profile, "oauth")
 
@@ -341,9 +377,17 @@ def current_mode_detailed(cfg, profile):
     is a default: an id that matches nothing returns "unknown" rather than
     silently naming a backend it hasn't actually confirmed."""
     env = cfg.get("env", {})
-    if env.get(K_USE_BEDROCK) != "1":
-        return "oauth"
     sonnet = env.get(K_SONNET, "")
+    if env.get(K_USE_BEDROCK) != "1":
+        # A direct-transport local mode is the one non-Bedrock backend other
+        # than oauth: ANTHROPIC_BASE_URL pointing at the profile's local
+        # endpoint, still confirmed by the sonnet id like every other mode.
+        if (local_transport(profile) == "direct"
+                and env.get(K_ANTHROPIC_BASE) == profile.get("local.base_url")):
+            if sonnet == profile.get("models.local").get("sonnet"):
+                return "local"
+            return "unknown"
+        return "oauth"
     if sonnet == profile.get("models.nexus").get("sonnet"):
         return "nexus"
     if sonnet == profile.get("models.gpt").get("sonnet"):
@@ -366,13 +410,16 @@ def status(profile):
         print(f"Active backend : {labels.get(mode, mode.upper())}")
     if mode == "nexus":
         print(f"  route        : Nexus (Claude) via {env.get(K_BASE_URL)}")
-        print(f"  proxy        : {_probe_label(proxy_probe(profile))}")
+        print(f"  proxy        : {_probe_label(proxy_probe(profile, 'nexus'))}")
     elif mode == "gpt":
         print("  route        : Nexus GPT tier (opus/sonnet/haiku pair rotation)")
-        print(f"  proxy        : {_probe_label(proxy_probe(profile))}")
+        print(f"  proxy        : {_probe_label(proxy_probe(profile, 'gpt'))}")
     elif mode == "local":
-        print(f"  route        : local model (vLLM) via {env.get(K_BASE_URL)}")
-        print(f"  proxy        : {_probe_label(proxy_probe(profile))}")
+        if local_transport(profile) == "direct":
+            print(f"  route        : local model direct via {env.get(K_ANTHROPIC_BASE)} (native Anthropic API)")
+        else:
+            print(f"  route        : local model via {env.get(K_BASE_URL)} (through the proxy)")
+            print(f"  proxy        : {_probe_label(proxy_probe(profile, 'local'))}")
         print(f"  local model  : {_probe_label(local_probe(profile))}")
     elif mode == "unknown":
         print("  route        : none - unrecognized model id, run `claude-mode <mode>` to set a known state")
@@ -397,14 +444,24 @@ def switch(target, profile):
     if now == target:
         print(f"Already on {target.upper()}. Nothing to do.")
         return
-    if target in ("nexus", "gpt", "local") and not proxy_ok(profile):
+    # Direct-transport local talks to no proxy, so the proxy gate would be
+    # meaningless there - its own endpoint is the thing that has to answer.
+    proxied = target in ("nexus", "gpt") or (
+        target == "local" and local_transport(profile) != "direct"
+    )
+    if proxied and not proxy_ok(profile, target):
+        target_url = _bedrock_base_url(profile, target)
         tunnel_host = profile.get_or("tunnel.host", None)
         if tunnel_host:
-            print(f"ABORT: Nexus proxy at {profile.get('bedrock.base_url')} is not answering.")
+            print(f"ABORT: Nexus proxy at {target_url} is not answering.")
             print(f"  A tunnel host is configured ({tunnel_host}). Run this first:")
             print("    claude-mode-tunnel up")
             sys.exit(1)
-        print(f"ABORT: Nexus proxy at {profile.get('bedrock.base_url')} is not answering. Staying on current.")
+        print(f"ABORT: Nexus proxy at {target_url} is not answering. Staying on current.")
+        sys.exit(1)
+    if target == "local" and not proxied and local_probe(profile) is None:
+        print(f"ABORT: local model endpoint at {profile.get('local.base_url')} is not answering.")
+        print("  Start the local model server first, then retry.")
         sys.exit(1)
     if target == "nexus":
         set_nexus(cfg, profile)
@@ -430,7 +487,8 @@ def switch(target, profile):
     elif target == "gpt":
         print("GPT mode: opus/sonnet/haiku pair rotation via the Nexus GPT tier")
     elif target == "local":
-        print(f"Local mode: all roles → {profile.get('models.local.sonnet')} (on-prem vLLM)")
+        via = "direct" if local_transport(profile) == "direct" else "via the proxy"
+        print(f"Local mode: all roles -> {profile.get('models.local.sonnet')} ({via})")
 
 
 def test(profile):

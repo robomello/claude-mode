@@ -38,6 +38,12 @@ DEFAULTS = {
     "local": {
         "base_url": "http://localhost:8901",
         "port": 8901,
+        # How the CLI reaches the local model. "bedrock" (the default, and
+        # the only behavior before this key existed) routes it through the
+        # Bedrock-compatible proxy like the nexus modes. "direct" points
+        # ANTHROPIC_BASE_URL straight at local.base_url, for a server that
+        # already speaks the Anthropic Messages API natively (e.g. Ollama).
+        "transport": "bedrock",
     },
     "claude_model": {
         "oauth": None,
@@ -61,9 +67,16 @@ DEFAULTS = {
 }
 
 # Dotted keys whose value must parse as an http/https URL with a host.
-_URL_KEYS = ("bedrock.base_url", "local.base_url")
+# bedrock.<mode>_base_url overrides are optional (see bin/claude-mode's
+# _bedrock_base_url) and have no default - only validated when a site sets one.
+_URL_KEYS = (
+    "bedrock.base_url", "local.base_url",
+    "bedrock.nexus_base_url", "bedrock.gpt_base_url", "bedrock.local_base_url",
+)
 # Dotted keys whose value must be an integer port in 1-65535.
 _PORT_KEYS = ("bedrock.port", "local.port")
+# Dotted keys restricted to a fixed set of values.
+_ENUM_KEYS = {"local.transport": ("bedrock", "direct")}
 
 
 class ProfileError(Exception):
@@ -145,6 +158,15 @@ def _validate_url(dotted_key, value):
         )
 
 
+def _validate_enum(dotted_key, value, allowed):
+    if value not in allowed:
+        raise ProfileError(
+            f"invalid value for '{dotted_key}': expected one of "
+            + ", ".join(repr(a) for a in allowed)
+            + f", got {value!r}"
+        )
+
+
 def _validate_port(dotted_key, value):
     try:
         port = int(value)
@@ -184,6 +206,10 @@ class Profile:
             found, val = _get_path(self._merged, key)
             if found:
                 _validate_port(key, val)
+        for key, allowed in _ENUM_KEYS.items():
+            found, val = _get_path(self._merged, key)
+            if found:
+                _validate_enum(key, val, allowed)
 
     def get(self, dotted_key):
         """Return the resolved value for dotted_key, or raise ProfileError

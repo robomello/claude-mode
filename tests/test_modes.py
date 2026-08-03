@@ -148,6 +148,66 @@ class ModeSwitchTests(unittest.TestCase):
         self.cm.set_local(cfg, self.profile)
         self.assertEqual(cfg["env"]["AWS_BEARER_TOKEN_BEDROCK"], "local-bypass")
 
+    def _direct_local_profile(self):
+        """Fixture profile with local.transport flipped to "direct"."""
+        with open(FIXTURE_PROFILE) as f:
+            raw = json.load(f)
+        raw["local"] = dict(raw["local"], transport="direct")
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(raw, f)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        return Profile(path=path)
+
+    def test_local_direct_transport_sets_anthropic_base_url_not_bedrock(self):
+        profile = self._direct_local_profile()
+        cfg = self._fresh_cfg()
+        self.cm.local_health_ok = lambda profile: True
+        self.cm.set_local(cfg, profile)
+
+        self.assertEqual(cfg["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8901")
+        self.assertEqual(cfg["env"]["ANTHROPIC_AUTH_TOKEN"], "local-direct")
+        self.assertEqual(cfg["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "test-local-model")
+        # The Bedrock path must be fully torn down, not left dangling beside it.
+        for key in ("CLAUDE_CODE_USE_BEDROCK", "ANTHROPIC_BEDROCK_BASE_URL",
+                    "AWS_BEARER_TOKEN_BEDROCK"):
+            self.assertNotIn(key, cfg["env"])
+        self.assertNotIn("forceLoginMethod", cfg)
+        self.assertEqual(cfg["env"]["CUSTOM_UNMANAGED"], "keep-me-too")
+
+    def test_local_direct_transport_is_detected_and_distinct_from_oauth(self):
+        profile = self._direct_local_profile()
+        cfg = self._fresh_cfg()
+        self.cm.local_health_ok = lambda profile: True
+        self.cm.set_local(cfg, profile)
+        self.assertEqual(self.cm.current_mode_detailed(cfg, profile), "local")
+        # Same env minus the model id match is not silently "oauth" either.
+        near_miss = dict(cfg, env=dict(cfg["env"],
+                                       ANTHROPIC_DEFAULT_SONNET_MODEL="test-local-model-2"))
+        self.assertEqual(self.cm.current_mode_detailed(near_miss, profile), "unknown")
+
+    def test_switching_off_direct_local_removes_its_env_keys(self):
+        # A stale ANTHROPIC_BASE_URL left behind would silently keep pointing
+        # the next backend at the local server.
+        profile = self._direct_local_profile()
+        cfg = self._fresh_cfg()
+        self.cm.local_health_ok = lambda profile: True
+        self.cm.set_local(cfg, profile)
+        self.cm.set_oauth(cfg, profile)
+        self.assertNotIn("ANTHROPIC_BASE_URL", cfg["env"])
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", cfg["env"])
+
+        cfg2 = self._fresh_cfg()
+        self.cm.set_local(cfg2, profile)
+        self.cm.set_nexus(cfg2, profile)
+        self.assertNotIn("ANTHROPIC_BASE_URL", cfg2["env"])
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", cfg2["env"])
+
+    def test_bedrock_transport_remains_the_default_for_local(self):
+        # Profiles written before local.transport existed must keep the
+        # proxied behavior with no edit.
+        self.assertEqual(self.cm.local_transport(self.profile), "bedrock")
+
     def test_current_mode_detailed_distinguishes_all_four(self):
         cfg = self._fresh_cfg()
         self.assertEqual(self.cm.current_mode_detailed(cfg, self.profile), "oauth")
@@ -236,7 +296,7 @@ class ModeSwitchTests(unittest.TestCase):
         os.environ["CLAUDE_MODE_PROFILE"] = variant
         with open(self.settings_path, "w") as f:
             json.dump(self._fresh_cfg(), f)  # detected mode: oauth
-        self.cm.proxy_ok = lambda profile: True
+        self.cm.proxy_ok = lambda profile, mode: True
 
         out = self._run_main("toggle")
 
@@ -253,7 +313,7 @@ class ModeSwitchTests(unittest.TestCase):
             json.dump(self._fresh_cfg(), f)
         with open(self.settings_path, "rb") as f:
             before = f.read()
-        self.cm.proxy_ok = lambda profile: True
+        self.cm.proxy_ok = lambda profile, mode: True
 
         buf = io.StringIO()
         old_argv = list(__import__("sys").argv)
@@ -294,7 +354,7 @@ class ModeSwitchTests(unittest.TestCase):
             json.dump(self._fresh_cfg(), f)
         # Bypass the real network probe - covered separately by profile/URL
         # validation and by manual verification against a live proxy.
-        self.cm.proxy_ok = lambda profile: True
+        self.cm.proxy_ok = lambda profile, mode: True
         self.cm.switch("nexus", self.profile)
 
         reloaded = cm_settings.load(self.settings_path)
@@ -304,7 +364,7 @@ class ModeSwitchTests(unittest.TestCase):
     def test_switch_prints_tunnel_command_when_proxy_down_and_tunnel_configured(self):
         with open(self.settings_path, "w") as f:
             json.dump(self._fresh_cfg(), f)
-        self.cm.proxy_ok = lambda profile: False
+        self.cm.proxy_ok = lambda profile, mode: False
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             with self.assertRaises(SystemExit) as ctx:
@@ -323,7 +383,7 @@ class ModeSwitchTests(unittest.TestCase):
 
         with open(self.settings_path, "w") as f:
             json.dump(self._fresh_cfg(), f)
-        self.cm.proxy_ok = lambda profile: False
+        self.cm.proxy_ok = lambda profile, mode: False
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             with self.assertRaises(SystemExit) as ctx:
@@ -362,7 +422,7 @@ class ModeSwitchTests(unittest.TestCase):
         # switch gate must not abort) but NOT healthy and NOT "up".
         err = urllib.error.HTTPError("http://127.0.0.1:8901/v1/models", 502, "Bad Gateway", None, None)
         with mock.patch("urllib.request.urlopen", side_effect=err):
-            self.assertTrue(self.cm.proxy_ok(self.profile))
+            self.assertTrue(self.cm.proxy_ok(self.profile, "nexus"))
             self.assertFalse(self.cm.local_health_ok(self.profile))
 
     def test_probe_label_distinguishes_up_answering_and_down(self):
@@ -370,6 +430,34 @@ class ModeSwitchTests(unittest.TestCase):
         self.assertIn("HTTP 503", self.cm._probe_label(503))
         self.assertNotEqual(self.cm._probe_label(503), "up")
         self.assertIn("not answering", self.cm._probe_label(None))
+
+    def test_gpt_base_url_override_used_instead_of_shared_bedrock_url(self):
+        # A site can point nexus-gpt at a different endpoint than
+        # nexus-claude (e.g. a translating proxy the raw gateway lacks)
+        # without disturbing nexus-claude's own base_url.
+        with open(FIXTURE_PROFILE) as f:
+            raw = json.load(f)
+        raw["bedrock"] = {
+            "base_url": "http://direct.invalid:443",
+            "gpt_base_url": "http://127.0.0.1:8104",
+        }
+        fd, override_path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(raw, f)
+        self.addCleanup(lambda: os.path.exists(override_path) and os.remove(override_path))
+        override_profile = Profile(path=override_path)
+        cfg = self._fresh_cfg()
+        self.cm.set_gpt(cfg, override_profile)
+        self.assertEqual(cfg["env"]["ANTHROPIC_BEDROCK_BASE_URL"], "http://127.0.0.1:8104")
+        cfg2 = self._fresh_cfg()
+        self.cm.set_nexus(cfg2, override_profile)
+        self.assertEqual(cfg2["env"]["ANTHROPIC_BEDROCK_BASE_URL"], "http://direct.invalid:443")
+
+    def test_bedrock_base_url_used_when_no_mode_override_present(self):
+        self.assertEqual(
+            self.cm._bedrock_base_url(self.profile, "gpt"),
+            self.profile.get("bedrock.base_url"),
+        )
 
     def test_pinned_mode_writes_top_level_model(self):
         cfg = self._fresh_cfg()

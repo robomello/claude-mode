@@ -78,13 +78,34 @@ remains accepted, but `nexus-gpt` is the canonical name.
 
 ## local
 
-Same shape again, pointed at an on-prem model reached through the same
-proxy.
+Points at an on-prem model. `local.transport` picks how the CLI reaches it:
 
-- Token lookup is `tokens.bedrock_env` only. If it's missing, `local` mode
-  does **not** abort - it uses a placeholder dummy string instead, because
-  local mode's requests don't actually leave the proxy to call anything that
-  checks the token. A note is printed either way.
+| `local.transport` | Wire path | Env keys written |
+|---|---|---|
+| `"bedrock"` (default) | through the Bedrock-compatible proxy, same as the nexus modes | `CLAUDE_CODE_USE_BEDROCK`, `ANTHROPIC_BEDROCK_BASE_URL`, `AWS_BEARER_TOKEN_BEDROCK` |
+| `"direct"` | straight to `local.base_url` | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` |
+
+`"bedrock"` is the default and the only behavior that existed before this
+key, so a profile written earlier keeps working untouched.
+
+Use `"direct"` when the local server already speaks the Anthropic Messages
+API natively - Ollama does, at `/v1/messages` - so no proxy or Bedrock
+emulation is needed in between. The two paths are mutually exclusive:
+entering one mode removes the other's env keys, and so do `oauth`,
+`nexus-claude`, and `nexus-gpt`, so a stale `ANTHROPIC_BASE_URL` can never
+keep pointing a later backend at the local server.
+
+The reachability gate follows the transport: `"bedrock"` gates on the proxy
+(and prints the `claude-mode-tunnel up` hint when a tunnel is configured),
+`"direct"` gates on `local.base_url` itself.
+
+- Token lookup (`"bedrock"` transport only) is `tokens.bedrock_env`. If it's
+  missing, `local` mode does **not** abort - it uses a placeholder dummy
+  string instead, because local mode's requests don't actually leave the
+  proxy to call anything that checks the token. A note is printed either
+  way. The `"direct"` transport looks up no token at all and writes a dummy
+  `ANTHROPIC_AUTH_TOKEN`, purely so the CLI never sends real OAuth/Nexus
+  credentials to the local endpoint.
 - Sets the four model-id keys from `models.local` (in practice a single
   on-prem model, so all four keys usually resolve to the same id - the
   installed CLI's client-side validation requires an id that starts with

@@ -9,6 +9,10 @@ laptop that's off the network the proxy actually listens on. In that case
 `claude-mode nexus-claude` / `nexus-gpt` / `local` will abort with "proxy is not
 answering" until you bring up an SSH tunnel first.
 
+A `local` mode with `local.transport: "direct"` is the exception - it talks to
+a model server on the machine itself, so it needs no proxy and no tunnel, and
+gates on its own endpoint instead. The rest of this doc doesn't apply to it.
+
 ## How it works
 
 `bin/claude-mode-tunnel` opens two local port forwards over SSH to a host
@@ -69,7 +73,8 @@ claude-mode-tunnel down     # optional - fine to leave it running
 
 `claude-mode nexus-claude/nexus-gpt/local` itself detects a down proxy and, if
 `tunnel.host` is configured, tells you to run `claude-mode-tunnel up` rather
-than just aborting blind.
+than just aborting blind. (A `direct`-transport `local` skips that gate - it
+has no proxy to check.)
 
 ## Per-platform notes
 

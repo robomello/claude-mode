@@ -24,6 +24,31 @@ class ProfileTests(unittest.TestCase):
             prof.get("nonexistent.made.up.key")
         self.assertIn("nonexistent.made.up.key", str(ctx.exception))
 
+    def test_gpt_base_url_override_validated_when_present(self):
+        path = self._write({"bedrock": {"gpt_base_url": "not-a-url"}})
+        with self.assertRaises(ProfileError) as ctx:
+            Profile(path=path)
+        self.assertIn("bedrock.gpt_base_url", str(ctx.exception))
+
+    def test_local_transport_defaults_to_bedrock(self):
+        path = self._write({})
+        self.assertEqual(Profile(path=path).get("local.transport"), "bedrock")
+
+    def test_local_transport_rejects_unknown_value(self):
+        path = self._write({"local": {"transport": "carrier-pigeon"}})
+        with self.assertRaises(ProfileError) as ctx:
+            Profile(path=path)
+        self.assertIn("local.transport", str(ctx.exception))
+
+    def test_local_transport_accepts_direct(self):
+        path = self._write({"local": {"transport": "direct"}})
+        self.assertEqual(Profile(path=path).get("local.transport"), "direct")
+
+    def test_gpt_base_url_override_absent_by_default(self):
+        path = self._write({})
+        prof = Profile(path=path)
+        self.assertIsNone(prof.get_or("bedrock.gpt_base_url", None))
+
     def test_malformed_url_rejected(self):
         path = self._write({"bedrock": {"base_url": "not-a-url", "port": 8104}})
         with self.assertRaises(ProfileError) as ctx:
