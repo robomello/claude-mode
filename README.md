@@ -254,3 +254,8 @@ tests/      unittest suite (`make test`)
 install.sh / uninstall.sh
 Makefile    `make check` = syntax check + compile + unittest + secret/site-value scrub
 ```
+
+## License
+
+MIT - see [LICENSE](LICENSE).
+
